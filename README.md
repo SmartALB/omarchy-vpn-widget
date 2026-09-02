@@ -6,6 +6,14 @@ the popup lists every connection with its state, and a click toggles it.
 Connections are created through the widget itself or by hand -- none ship
 with the plugin.
 
+**What this is for.** Connections you run yourself: your own OpenVPN server,
+a router, a WireGuard peer -- the ones that authenticate with a certificate
+or a key. Configurations that log in with a user name and password
+(`auth-user-pass`), which is what most commercial providers hand out, are
+deliberately not accepted; the reason is under "What gets accepted -- and
+why not more". WireGuard is not affected by this at all: it authenticates by
+key and has no notion of a password.
+
 ![The panel: connection list on top, the file picker below](images/panel-add-connection.png)
 
 ## Installation
@@ -508,8 +516,21 @@ directive is not on the list and is rejected -- too strict in case of
 doubt, never too lax.
 
 Expressly rejected as well are `auth-user-pass`, `askpass` and
-`static-challenge`: credentials are not supported, and a systemd unit has
-nobody it could ask for a password.
+`static-challenge`. Three reasons, and they point the same way.
+
+A unit started by systemd has nobody it could ask: there is no terminal and
+no dialog behind it, so a configuration that wants to be asked would hang
+rather than connect.
+
+Written inline, `<auth-user-pass>user\npassword</auth-user-pass>` is a valid
+OpenVPN configuration -- and would drop the password in the clear into
+`/etc/openvpn/client/`, a directory whose whole point is that the user
+cannot write to it.
+
+And it is a decision about scope, not a gap: this widget is for connections
+you run yourself, where a certificate or a key does the authenticating.
+Supporting user name and password would mean storing credentials somewhere,
+and that is a different program with different questions to answer.
 
 For **WireGuard** it stays a **blocklist** -- `PostUp`, `PreUp`,
 `PostDown`, `PreDown`. The reason is verifiably different: in the
