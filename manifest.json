@@ -1,11 +1,11 @@
 {
   "schemaVersion": 1,
   "id": "smartalb.vpn",
-  "name": "VPN",
-  "version": "1.2.1",
+  "name": "VPN Units",
+  "version": "1.2.2",
   "author": "SmartALB",
   "license": "MIT",
-  "description": "Switch, create and remove OpenVPN and WireGuard connections from the bar",
+  "description": "OpenVPN and WireGuard as systemd units -- so a mount or service that depends on a tunnel keeps working. Imports .ovpn and .conf files through a checked allowlist; certificate and key auth only.",
   "kinds": [
     "bar-widget"
   ],
@@ -13,8 +13,8 @@
     "barWidget": "Panel.qml"
   },
   "barWidget": {
-    "displayName": "VPN",
-    "description": "Show and switch VPN connections",
+    "displayName": "VPN Units",
+    "description": "Show and switch VPN connections held as systemd units",
     "category": "System",
     "allowMultiple": false,
     "defaultSection": "right"

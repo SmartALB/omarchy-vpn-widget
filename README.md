@@ -1,4 +1,4 @@
-# VPN -- connections from the Omarchy bar
+# VPN Units -- OpenVPN and WireGuard from the Omarchy bar
 
 An Omarchy bar widget for OpenVPN and WireGuard connections. The bar button
 shows a closed padlock as soon as at least one configured connection is up;
