@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# Prints the configured VPN connections together with their state as JSON.
+# Usage: omarchy-vpn-list --json
+#
+# Errors go to stdout as a JSON object with "error" -- that way the panel
+# can always parse, instead of guessing at empty output.
+set -uo pipefail
+
+. "$(dirname "$(readlink -f "$0")")/_common.sh"
+
+ME="$(basename "$0")"
+
+# Errors go to stdout as a JSON object so that the panel can always parse.
+# Deliberately with printf instead of jq: the "jq is not installed" path has to
+# work without jq. The messages are fixed, so no general JSON escaping is
+# needed.
+emit_error_raw() {
+  printf '{"error":"%s"}\n' "$1"
+}
+
+# A check of its own instead of need_jq from _common.sh: need_jq only
+# reports on stderr and exits, without honouring the JSON error contract on
+# stdout. _common.sh stays untouched because other scripts rely on need_jq.
+if ! command -v jq >/dev/null 2>&1; then
+  echo "$ME: jq is not installed" >&2
+  emit_error_raw "jq is not installed"
+  exit 3
+fi
+
+if [ "${1:-}" != "--json" ]; then
+  echo "Usage: $ME --json" >&2
+  emit_error_raw "Usage: $ME --json"
+  exit 1
+fi
+
+emit_error() {
+  jq -nc --arg msg "$1" '{error: $msg}'
+}
+
+if ! conns="$(read_connections)"; then
+  emit_error "connection list not readable: $CONNECTIONS_FILE"
+  exit 5
+fi
+
+# It used to be: one 'jq -c .[]' per entry, then PER ENTRY four 'jq -r' for
+# id/label/unit/group plus one 'jq -c' to assemble it -- 15 jq processes for
+# three connections, and that on every 10-second tick of the panel timer,
+# even with the popup closed (noticeable on battery). Now: a constant three
+# jq calls, no matter how many connections are configured.
+#
+# The field handling that review I2 fixed stays as it is: it never came
+# down to shell word splitting (that was the actual bug, not the principle
+# of "one jq per entry"), but to filling in each field individually via jq
+# with a default instead of taking it apart with '@tsv'/'read'. Step 1 still
+# does exactly that -- only for ALL entries in a single jq call instead of
+# one per entry: 'id // ""', 'label // ""' and so on assign the fields
+# directly while the object is being built, so nothing can slip out of
+# place there. Entries with an empty/missing "id" drop out right away
+# (review I2, second case). '-r' prints values that are themselves strings
+# unquoted (the unit names), and everything else (the normalized array)
+# compactly as with '-c' -- which is why this single call yields two
+# things: line 1 is the normalized array as JSON, every following line is
+# the unit name of one entry, in the same order as in the array.
+norm_out="$(printf '%s' "$conns" | jq -r '
+  [.[] | select((.id // "") != "")
+   | {id: (.id // ""), label: (.label // ""),
+      unit: (.unit // ""), group: (.group // "")}]
+  as $norm
+  | ($norm | tojson), ($norm[].unit)
+')"
+
+mapfile -t norm_lines <<<"$norm_out"
+entries="${norm_lines[0]}"
+units=("${norm_lines[@]:1}")
+
+# Step 2: one 'unit_state()' per unit -- that inevitably stays one per
+# connection, it is a systemctl call, not jq. The states are collected first
+# and only afterwards turned into a JSON array in a single jq call ('-R -s':
+# read every line raw, read it all at once, hand it to split("\n")).
+# 'map(select(length>0))' discards only the empty line produced by the
+# trailing newline -- unit_state() itself never returns an empty string
+# (test_unit_state_never_empty).
+states=()
+for unit in "${units[@]}"; do
+  states+=("$(unit_state "$unit")")
+done
+states_json="$(printf '%s\n' "${states[@]}" | jq -R -s -c 'split("\n") | map(select(length>0))')"
+
+# Step 3: one last jq call attaches the states to the entries -- by index,
+# in the same order in which both were produced. "group" still gets 'null'
+# here instead of an empty string, as before.
+result="$(jq -c --argjson states "$states_json" '
+  . as $entries
+  | [range(0; ($entries | length)) as $i
+     | ($entries[$i]
+        + {group: (if $entries[$i].group == "" then null else $entries[$i].group end),
+           state: $states[$i]})]
+' <<<"$entries")"
+
+printf '%s\n' "$result"

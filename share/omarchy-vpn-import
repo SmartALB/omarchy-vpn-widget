@@ -1,0 +1,618 @@
+#!/bin/bash -p
+# Places a VPN configuration into /etc or removes it again -- and nothing
+# else.
+#
+# This program runs as root via pkexec. Unlike omarchy-vpn-privileged it is
+# NOT reachable without a password: the polkit action demands administrator
+# authentication. The security of the whole design rests on exactly that --
+# a pasted OpenVPN configuration is free to execute arbitrary code as root
+# via 'script-security 2' plus 'up <script>'. Were the import passwordless,
+# the widget would be a root shell.
+#
+# FOUR RULES that hold whenever this file is changed:
+#
+#   1. Shebang with -p and without env: the interpreter must not come from
+#      $PATH and must not take over inherited functions or BASH_ENV.
+#
+#   2. Read NOTHING from the environment. Source NOTHING. That is why the
+#      allowlist stands inline -- even though it also stands in
+#      bin/omarchy-vpn-inspect. A shared file would have to be protected
+#      itself and would turn one trusted file into two. The parity test in
+#      test/run-tests.sh holds the two versions together.
+#      The test suite runs a copy in which only the two directory lines
+#      below are substituted; their exact spelling is a contract.
+#
+#   3. Do not live anywhere the user can write. It is installed to
+#      /usr/local/bin, root:root, 755.
+#
+#   4. Do not trust the caller. bin/omarchy-vpn-inspect has already run the
+#      same check -- that one is for display, not for security. The caller
+#      could be somebody else entirely.
+#
+# Usage: omarchy-vpn-import add <openvpn|wireguard> <name>   (content on stdin)
+#        omarchy-vpn-import remove <openvpn|wireguard> <name>
+#
+# The content arrives EXCLUSIVELY over stdin, never as a path. A path would
+# amount to a read privilege here: this program runs as root and could
+# therefore import a file the calling user is not allowed to read at all.
+# That is why bin/omarchy-vpn-add reads the file as the user and passes only
+# the content on through the pipe.
+set -uo pipefail
+
+# The character set for <name> is a binding constraint (A-Z a-z 0-9 _ . -):
+# a name with a single composed character (U+00FC, lowercase u with
+# diaeresis, for instance) matches [[ "$name" =~ ^[A-Za-z0-9_.-]+$ ]] under a
+# UTF-8 locale, but not under C. Pinned to C, regardless of what the caller
+# brings along in the environment -- unlike the switching program
+# (omarchy-vpn-privileged), this one runs no systemctl, so nobody inherits
+# that program's message language.
+export LC_ALL=C
+
+# A deterministic file mode for everything this program creates --
+# independent of the inherited umask. mktemp is NOT umask-independent: under
+# umask 0200 it creates a file with mode 0400 (verified), which would make
+# the write that follows fail. umask is a shell builtin, not one more
+# external command.
+umask 077
+
+ME="${0##*/}"
+
+# The exact spelling of these two lines is a contract: test/run-tests.sh
+# substitutes precisely them so it writes into the sandbox instead of /etc.
+OPENVPN_DIR=/etc/openvpn/client
+WIREGUARD_DIR=/etc/wireguard
+
+die() { printf '%s: %s\n' "$ME" "$2" >&2; exit "$1"; }
+
+action="${1:-}"
+case "$action" in
+  add)    [ $# -eq 3 ] || die 64 "Usage: $ME add <openvpn|wireguard> <name>" ;;
+  remove) [ $# -eq 3 ] || die 64 "Usage: $ME remove <openvpn|wireguard> <name>" ;;
+  *)      die 64 "disallowed action: ${action:-<empty>} (allowed: add, remove)" ;;
+esac
+
+kind="$2"
+name="$3"
+case "$kind" in
+  openvpn)   dir="$OPENVPN_DIR"; maxlen=64 ;;
+  wireguard) dir="$WIREGUARD_DIR"; maxlen=15 ;;
+  *) die 64 "unknown kind: $kind (allowed: openvpn, wireguard)" ;;
+esac
+
+# The name becomes the file name AND the unit instance. The character set is
+# the same one omarchy-vpn-privileged accepts when switching -- a name the
+# import let through and the switching program rejected would be a connection
+# that can be created but never started.
+if ! [[ "$name" =~ ^[A-Za-z0-9_.-]+$ ]] || [ "${name:0:1}" = "-" ] \
+   || [ "$name" = "." ] || [ "$name" = ".." ] || [ "${#name}" -gt "$maxlen" ]; then
+  die 70 "disallowed name: ${name:-<empty>} (allowed: A-Z a-z 0-9 _ . -, no leading '-', at most $maxlen characters)"
+fi
+
+target="$dir/$name.conf"
+
+if [ "$action" = "remove" ]; then
+  # Forgiving: a file that is already gone is not an error.
+  if [ -e "$target" ]; then
+    rm -f -- "$target" || die 74 "could not remove $target"
+  fi
+  exit 0
+fi
+
+[ -d "$dir" ] || die 74 "directory is missing: $dir"
+
+# Whether the target file already exists is NOT checked here any more -- that
+# happens only after the allowlist, further down. The reason is stated
+# there.
+
+content="$(cat)"
+[ -n "${content//[[:space:]]/}" ] || die 73 "input is empty"
+# Normalized: exactly one trailing newline -- WORD FOR WORD the same as
+# bin/omarchy-vpn-inspect. A command substitution would throw it away again
+# at once (that is why "$content" above already arrives without a trailing
+# newline); so at the place where it counts (writing) it is appended below
+# through a direct redirection instead of through a variable.
+#
+# That both programs normalize identically remains a contract, even without
+# the fingerprint comparison: bin/omarchy-vpn-inspect judges and measures
+# exactly the bytes that get written here. The evidence is the .sha256 field
+# over there and the tests that hold it against the written file.
+normalized="$(printf '%s\n' "$content")"
+
+# --- Allowlist and check, second copy. See rule 2 in the header. ---
+violation=""; violation_line=""
+
+# Truncates a token to at most 24 characters and appends "..." when it does
+# (three separate periods, no special character). Keeps key material out of
+# error messages -- the same function stands for the same reason in
+# bin/omarchy-vpn-inspect; the parity test holds the two together. Inline for
+# the same reason as the allowlist (rule 2 in the header): source nothing.
+trunc() {
+  local s="$1" max=24
+  if [ "${#s}" -gt "$max" ]; then
+    printf '%s...' "${s:0:$max}"
+  else
+    printf '%s' "$s"
+  fi
+}
+
+# Normalizes the spelling of an option name. openvpn also accepts directives
+# with a leading '--' and in quotes: '--up', '"up"' and "'up'" are all the
+# same as 'up' to openvpn (verified against 2.7.6). Without this
+# normalization the allowlist would turn away valid spellings -- and any
+# later denylist could be evaded through exactly this gap. The word as it
+# stands in the file is left untouched for the message.
+normalize_word() {
+  local w="$1"
+  w="${w%\"}"; w="${w#\"}"
+  w="${w%\'}"; w="${w#\'}"
+  w="${w#--}"
+  w="${w%\"}"; w="${w#\"}"
+  w="${w%\'}"; w="${w#\'}"
+  printf '%s' "$w"
+}
+
+# --- OpenVPN allowlist ---
+#
+# What is enumerated is what is ALLOWED, not what would be forbidden. Three
+# denylist versions failed at the very same point: openvpn 2.7.6 knows 297
+# directives, and a denylist only protects against what somebody read
+# beforehand. The last two it missed were 'http-proxy-user-pass <file>'
+# (openvpn reads the file as root and sends its beginning base64-encoded to
+# the proxy) and 'dev-node unix:<program>' ("OpenVPN will start the program",
+# with no script-security at all). Both are documented as accepted by 2.7.6.
+#
+# Included is what a SELF-CONTAINED client configuration needs: peer,
+# protocol, device, encryption and negotiation, certificate verification,
+# timing and retry behavior, message verbosity, routing. Included is NOTHING
+# that reads or writes a file, starts a program, opens a control channel or
+# switches into server mode. Every single entry was checked against the
+# openvpn 2.7.6 man page for exactly those four effects.
+#
+# Three entries that are not self-evident:
+#   - 'route', 'route-*' and 'redirect-gateway' change the routing -- which
+#     is precisely what a VPN is for. They execute no code and read no file;
+#     'iproute' (which routes via a PROGRAM) is consistently absent.
+#   - 'pull-filter' and 'ignore-unknown-option' can only TAKE AWAY: the one
+#     discards options pushed by the server, the other makes unknown
+#     directives non-fatal. Neither can add anything.
+#   - 'block-outside-dns' does not exist in openvpn on Linux at all; it is
+#     here because commercial providers ship it as 'setenv opt
+#     block-outside-dns' and the line would otherwise turn away a valid
+#     configuration.
+#
+# A directive newly added in some future openvpn version is not on the list
+# and gets rejected -- when in doubt too strict, never too lax. That is the
+# right direction for a gate with something running as root behind it.
+#
+# Word for word identical in bin/omarchy-vpn-inspect and
+# share/omarchy-vpn-import; the parity test in test/run-tests.sh holds the
+# two together.
+allowed_openvpn() {
+  case "$1" in
+    allow-compression|auth|auth-nocache|auth-retry|bind|\
+    block-outside-dns|cipher|client|comp-lzo|comp-noadapt|\
+    compat-mode|compress|connect-retry|connect-retry-max|\
+    connect-timeout|data-ciphers|data-ciphers-fallback|dev|dev-type|\
+    dhcp-option|disable-dco|disable-occ|dns|ecdh-curve|\
+    explicit-exit-notify|fast-io|float|fragment|group|hand-window|\
+    ignore-unknown-option|inactive|keepalive|key-direction|link-mtu|\
+    local|lport|max-packet-size|mssfix|mtu-disc|mute|\
+    mute-replay-warnings|ncp-ciphers|ncp-disable|nobind|ns-cert-type|\
+    passtos|peer-fingerprint|persist-key|persist-local-ip|\
+    persist-remote-ip|persist-tun|ping|ping-exit|ping-restart|\
+    ping-timer-rem|port|proto|proto-force|pull|pull-filter|\
+    push-peer-info|rcvbuf|redirect-gateway|redirect-private|remote|\
+    remote-cert-eku|remote-cert-ku|remote-cert-tls|remote-random|\
+    remote-random-hostname|reneg-bytes|reneg-pkts|reneg-sec|\
+    replay-window|resolv-retry|route|route-delay|route-gateway|\
+    route-ipv6|route-ipv6-gateway|route-metric|route-noexec|\
+    route-nopull|route-table|rport|server-poll-timeout|setenv|\
+    setenv-safe|shaper|sndbuf|tcp-nodelay|tls-cert-profile|\
+    tls-cipher|tls-ciphersuites|tls-client|tls-groups|tls-timeout|\
+    tls-version-max|tls-version-min|topology|tran-window|tun-mtu|\
+    tun-mtu-extra|tun-mtu-max|txqueuelen|up-delay|user|verb|\
+    verify-hash|\
+    verify-x509-name|x509-username-field)
+      return 0 ;;
+  esac
+  return 1
+}
+
+# The message says the directive is not on the LIST -- not that it is
+# forbidden. The difference matters: most rejected directives are harmless
+# and are missing only because nobody has needed them yet. And it names the
+# way around, the one the spec explicitly requires: place the file by hand
+# into /etc/openvpn/client/.
+not_allowed_msg() {
+  printf 'Directive is not on the allowlist: %s -- that does not classify it as dangerous, it is merely missing. If you need it, place the file by hand into /etc/openvpn/client/.' "$(trunc "$1")"
+}
+
+# Credentials are missing from the list like everything else -- but here the
+# reason can be named, so it is named: a systemd unit has nobody it could ask
+# for a password, and there is no secret store (out of scope per the spec).
+# The way around is stated here too: this is the most frequent rejection, and
+# without it the user ends up at a dead end.
+credentials_msg() {
+  printf 'Credentials are not supported: %s -- a systemd unit has nobody it could ask for them. If you need them, place the file by hand into /etc/openvpn/client/.' "$(trunc "$1")"
+}
+
+check_openvpn() {
+  local n=0 line word rest cword inblock="" tag inner trimmed
+  local -a parts
+  while IFS= read -r line; do
+    n=$((n + 1))
+    # Skip embedded blocks: that is where key material lives. How a block
+    # marker is read is the most delicate spot of this whole check -- five of
+    # the findings so far were not about directive names but about what
+    # happens before them, in taking the line apart. The rule the three
+    # sections below obey: OUR ORDER MUST MATCH OPENVPN'S. And where it
+    # differs, only in one direction -- we may stop skipping earlier than
+    # openvpn, never later.
+    #
+    # <connection> blocks are EXEMPT from this skipping: unlike
+    # <ca>/<cert>/<key> they hold no key data but real directives. Their
+    # content is therefore checked just like the top level.
+    #
+    # It used to be skipped, on this reasoning: inside a <connection> block
+    # openvpn allows only a fixed, small option list of its own (bind,
+    # connect-retry, connect-retry-max, connect-timeout,
+    # explicit-exit-notify, float, fragment, http-proxy, http-proxy-option,
+    # key-direction, link-mtu, local, lport, mssfix, mtu-disc, nobind, port,
+    # proto, remote, rport, socks-proxy, tls-auth, tls-crypt, tls-crypt-v2,
+    # tun-mtu, tun-mtu-extra -- source:
+    # doc/man-sections/connection-profiles.rst in the openvpn repo). For the
+    # CODE-EXECUTING directives that holds and stays true: openvpn rejects
+    # 'up' there with "option 'up' cannot be used in this context
+    # ([CONNECTION-OPTIONS])" (verified against 2.7.6).
+    #
+    # For the FILE-POINTING ones it does NOT hold -- http-proxy, socks-proxy,
+    # tls-auth, tls-crypt and tls-crypt-v2 are themselves on that option
+    # list. 'tls-auth <path>' inside the block loads the file ("Cannot
+    # pre-load keyfile", verified), and 'http-proxy <host> <port> <file>'
+    # makes openvpn read it as root and send its beginning to a peer of the
+    # attacker's choosing. So the skipping really was a second way around
+    # (Review C2).
+
+    # Strip the indentation FIRST, check for the marker SECOND. The order is
+    # not a matter of taste, it is imitation: openvpn strips first. The other
+    # way round, an indented closing marker ("<TAB></ca>") closed the block
+    # for openvpn but not for us -- everything after it counted as block
+    # content to us and was silently skipped, while openvpn evaluated it as a
+    # top-level directive. An ordinary <cert> block further down was enough
+    # to keep even the "never closed" fallback from catching it. Verified
+    # against 2.7.6.
+    line="${line#"${line%%[![:space:]]*}"}"
+
+    # Closing marker: openvpn ends the block as soon as a line BEGINS with
+    # "</tag>" -- trailing text does no harm ("</ca> trailing" and "</ca>x"
+    # both close, verified). We close on any "</" without comparing the tag;
+    # openvpn requires the tags to match ("</cb>" does not close there). That
+    # is deliberate: it can only make us stop skipping EARLIER than openvpn,
+    # never later -- and only "later" would be a hole.
+    case "$line" in
+      "</"*) inblock=""; continue ;;
+    esac
+
+    # Inside a block nothing is checked and nothing is read as a marker: that
+    # is where key material lives. This line deliberately stands BEFORE the
+    # opening marker -- exactly like openvpn, which inside a block looks for
+    # nothing but the closing marker.
+    [ -n "$inblock" ] && continue
+
+    # An opening marker only in the form openvpn accepts: the line must be
+    # EXACTLY "<tag>" -- no indentation, no trailing whitespace. "<ca>
+    # trailing", "<ca x>" and "x<ca>" are not markers to openvpn but unknown
+    # options that make it abort (verified against 2.7.6). We used to treat
+    # them as the start of a block -- the check then skipped lines openvpn
+    # would have evaluated. A line that falls through here ends up in the
+    # directive check below and is rejected as "Unexpected directive
+    # spelling" -- the same verdict openvpn reaches, only without relying
+    # on it.
+    trimmed="${line%"${line##*[![:space:]]}"}"
+    if [[ "$trimmed" =~ ^\<([A-Za-z][A-Za-z0-9_-]*)\>$ ]]; then
+      tag="${BASH_REMATCH[1]}"
+      # Only what is REALLY key material gets skipped. It used to be that
+      # EVERY <tag> block was skipped -- and openvpn can inline more than
+      # keys: '<auth-user-pass>user/password</auth-user-pass>' is a valid
+      # configuration (verified against 2.7.6) and used to drop the cleartext
+      # password into /etc/openvpn/client/, while the very same thing written
+      # as a directive was rejected. The same goes for
+      # '<http-proxy-user-pass>' and '<auth-gen-token-secret>'.
+      #
+      # The man page names 15 inline-capable options (section INLINE FILE
+      # SUPPORT) -- and is not complete for all that. Sending all 297
+      # directives inline one by one, 2.7.6 additionally accepts twelve that
+      # are not named there: 'compat-mode', 'disable-dco',
+      # 'ifconfig-ipv6-push', 'iroute', 'iroute-ipv6', 'max-routes',
+      # 'override-username', 'prng', 'providers', 'push-remove',
+      # 'route-ipv6-gateway', 'secret'. With '<providers>' openvpn will even
+      # load an OpenSSL library. That is exactly why the default "every
+      # unknown block is rejected" is the right one -- it covered those
+      # twelve without anyone having to know them beforehand. What stands
+      # here is only what a self-contained client configuration really needs
+      # -- the same rule as for the directives, one level up. Everything else
+      # is judged like a directive and so falls through the allowlist.
+      #
+      # Code cannot get in by this route: openvpn itself rejects '<up>',
+      # '<plugin>', '<script-security>', '<config>', '<log>' and '<dev-node>'
+      # with "option 'X' is not expected to be inline" (verified). We reject
+      # them ourselves anyway rather than rely on that.
+      case "$tag" in
+        connection) ;;
+        ca|cert|key|dh|extra-certs|pkcs12|crl-verify|tls-auth|tls-crypt|\
+        tls-crypt-v2|peer-fingerprint|verify-hash) inblock="$tag" ;;
+        auth-user-pass|askpass|static-challenge)
+          violation="$(credentials_msg "<$tag>")"
+          violation_line="$n"; return ;;
+        *)
+          violation="$(not_allowed_msg "<$tag>")"
+          violation_line="$n"; return ;;
+      esac
+      continue
+    fi
+    case "$line" in ""|"#"*|";"*) continue ;; esac
+    word="${line%%[[:space:]]*}"
+    rest="${line#"$word"}"; rest="${rest#"${rest%%[![:space:]]*}"}"
+
+    cword="$(normalize_word "$word")"
+
+    # After normalization an option name has to be left over. Anything else
+    # is a spelling we cannot judge -- and what we cannot judge, we do not
+    # let through (this also catches variants nobody thought of beforehand,
+    # e.g. 'u"p"' or '---up').
+    if ! [[ "$cword" =~ ^[A-Za-z][A-Za-z0-9-]*$ ]]; then
+      violation="Unexpected directive spelling: $(trunc "$word")"
+      violation_line="$n"; return
+    fi
+
+    # 'setenv opt <directive>' is NOT a variable assignment but a prefix:
+    # openvpn strikes the two words and processes the rest as a perfectly
+    # ordinary directive. Documented against 2.7.6 -- 'setenv opt up /tmp/x'
+    # fails with "--up script fails with '/tmp/x'", word for word the same as
+    # 'up /tmp/x'. Without this spot, 'setenv' on the allowlist would be a
+    # master key for everything that is not on it. A second prefix does not
+    # work: openvpn silently drops 'setenv opt setenv opt up' (it reports
+    # 'setenv' as unknown, and the prefix makes that report non-fatal) -- the
+    # inner directive is never executed. So no recursion is needed. 'setenv'
+    # still has to stay on the list: the providers ship 'setenv opt
+    # block-outside-dns' by the million.
+    if [ "$cword" = "setenv" ]; then
+      read -r -a parts <<<"$rest"
+      # openvpn compares 'opt' in lowercase ('setenv OPT up ...' is an
+      # ordinary variable, verified). Here deliberately case-insensitive:
+      # the check may be stricter than openvpn, never laxer.
+      if [ "$(printf '%s' "${parts[0]:-}" | tr 'A-Z' 'a-z')" = "opt" ]; then
+        inner="$(normalize_word "${parts[1]:-}")"
+        if ! [[ "$inner" =~ ^[A-Za-z][A-Za-z0-9-]*$ ]]; then
+          violation="Unexpected directive spelling: $(trunc "${parts[1]:-setenv opt}")"
+          violation_line="$n"; return
+        fi
+        if ! allowed_openvpn "$inner"; then
+          violation="setenv opt: $(not_allowed_msg "${parts[1]}")"
+          violation_line="$n"; return
+        fi
+        continue
+      fi
+    fi
+
+    case "$cword" in
+      auth-user-pass|askpass|static-challenge)
+        violation="$(credentials_msg "$word")"
+        violation_line="$n"; return ;;
+    esac
+
+    if ! allowed_openvpn "$cword"; then
+      violation="$(not_allowed_msg "$word")"
+      violation_line="$n"; return
+    fi
+  done <<<"$1"
+
+  # A block that is never closed would have swallowed everything after it.
+  if [ -n "$inblock" ]; then
+    violation="Embedded block <$(trunc "$inblock")> was never closed"; violation_line="$n"
+  fi
+}
+
+check_wireguard() {
+  local n=0 line word
+  while IFS= read -r line; do
+    n=$((n + 1))
+    line="${line#"${line%%[![:space:]]*}"}"
+    case "$line" in ""|"#"*) continue ;; esac
+    word="${line%%[[:space:]=]*}"
+    case "$(printf '%s' "$word" | tr 'A-Z' 'a-z')" in
+      postup|preup|postdown|predown)
+        violation="Directive executes code as root: $(trunc "$word")"; violation_line="$n"; return ;;
+    esac
+  done <<<"$1"
+}
+
+# Determines the kind -- and does so BLOCK-AWARE, exactly like check_openvpn.
+# An embedded <ca> block holds base64, not directives; if the string
+# "[Interface]" stood in there, the file would otherwise count as WireGuard
+# and check_openvpn would never run (Review I1). Kind detection is the switch
+# BEFORE the security check, not mere display.
+#
+# <connection> is -- as in check_openvpn -- NOT a skipped block here: its
+# content is real directives, 'remote' among them. A configuration whose only
+# peer sits inside a <connection> block is recognized as OpenVPN at all only
+# because of this.
+#
+# Leading whitespace is stripped before comparing: openvpn accepts indented
+# directives (verified against 2.7.6). Only one of the two versions used to
+# strip the indentation -- that was the single place where inspect and import
+# genuinely drifted apart (Review I2).
+# Word for word identical with bin/omarchy-vpn-inspect; the parity test holds
+# the two together.
+detect_kind() {
+  local line inblock="" ovpn="" trimmed
+  while IFS= read -r line; do
+    # Strip the indentation FIRST, check for the marker SECOND. The order is
+    # not a matter of taste, it is imitation: openvpn strips first. The other
+    # way round, an indented closing marker ("<TAB></ca>") closed the block
+    # for openvpn but not for us -- everything after it counted as block
+    # content to us and was silently skipped, while openvpn evaluated it as a
+    # top-level directive. An ordinary <cert> block further down was enough
+    # to keep even the "never closed" fallback from catching it. Verified
+    # against 2.7.6.
+    line="${line#"${line%%[![:space:]]*}"}"
+
+    # Closing marker: openvpn ends the block as soon as a line BEGINS with
+    # "</tag>" -- trailing text does no harm ("</ca> trailing" and "</ca>x"
+    # both close, verified). We close on any "</" without comparing the tag;
+    # openvpn requires the tags to match ("</cb>" does not close there). That
+    # is deliberate: it can only make us stop skipping EARLIER than openvpn,
+    # never later -- and only "later" would be a hole.
+    case "$line" in
+      "</"*) inblock=""; continue ;;
+    esac
+
+    # Inside a block nothing is checked and nothing is read as a marker: that
+    # is where key material lives. This line deliberately stands BEFORE the
+    # opening marker -- exactly like openvpn, which inside a block looks for
+    # nothing but the closing marker.
+    [ -n "$inblock" ] && continue
+
+    # An opening marker only in the form openvpn accepts: the line must be
+    # EXACTLY "<tag>" -- no indentation, no trailing whitespace. "<ca>
+    # trailing", "<ca x>" and "x<ca>" are not markers to openvpn but unknown
+    # options that make it abort (verified against 2.7.6). We used to treat
+    # them as the start of a block -- the check then skipped lines openvpn
+    # would have evaluated. A line that falls through here ends up in the
+    # directive check below and is rejected as "Unexpected directive
+    # spelling" -- the same verdict openvpn reaches, only without relying
+    # on it.
+    trimmed="${line%"${line##*[![:space:]]}"}"
+    if [[ "$trimmed" =~ ^\<([A-Za-z][A-Za-z0-9_-]*)\>$ ]]; then
+      # For kind detection EVERY block is skipped, including one that
+      # check_openvpn rejects a moment later (<auth-user-pass>, say).
+      # Detection is the switch BEFORE the check: if it let the content of
+      # such a block count, an "[Interface]" hidden in there could declare
+      # the file a WireGuard configuration and check_openvpn would never run
+      # (Review I1).
+      case "${BASH_REMATCH[1]}" in connection) ;; *) inblock="${BASH_REMATCH[1]}" ;; esac
+      continue
+    fi
+    case "$line" in
+      *"[Interface]"*) printf 'wireguard'; return 0 ;;
+    esac
+    if [ -z "$ovpn" ]; then
+      case "$line" in
+        client|client\ *|remote\ *|dev\ tun*|dev\ tap*) ovpn=1 ;;
+      esac
+    fi
+  done <<<"$1"
+  [ -n "$ovpn" ] && printf 'openvpn'
+  return 0
+}
+
+# Cross-check the kind instead of believing the argument.
+detected="$(detect_kind "$normalized")"
+if [ "$kind" = "wireguard" ]; then
+  [ "$detected" = "wireguard" ] || die 73 "no WireGuard configuration recognized (expected: '[Interface]')"
+  check_wireguard "$normalized"
+else
+  [ "$detected" = "openvpn" ] || die 73 "no OpenVPN configuration recognized (expected: 'client' or 'remote')"
+  check_openvpn "$normalized"
+fi
+
+[ -z "$violation" ] || die 71 "line $violation_line: $violation"
+
+# --- The target file is already there ---
+#
+# This check stands HERE ON PURPOSE, behind the allowlist, and no longer up
+# top before stdin is read. Otherwise "already exists" would be a way past
+# the check: a configuration that does not pass the allowlist has to be
+# rejected -- even when it happens to be byte-identical with the existing
+# file. Check first, compare second.
+#
+# If the existing file is byte-identical with what would be written now,
+# there is NOTHING TO DO: exit successfully without writing. That resolves
+# the dead end anyone lands in who removed a connection via the cross without
+# ticking "also delete the file" -- the list entry is gone, the
+# file still sits in /etc, and without an entry the widget has no handle on
+# it any more (bin/omarchy-vpn-forget needs <id> and <unit> from the list).
+# Picking the same file once more is now enough; bin/omarchy-vpn-add then
+# creates the list entry again.
+#
+# The comparison is against EXACTLY the bytes that would be written below --
+# 'printf %s\n "$content"', not "$normalized". $normalized is the version for
+# the check; what gets written is $content with exactly one trailing newline.
+# Were those two expressions ever to drift apart, an "identical" here would
+# be a lie about the file's content.
+#
+# The comparison belongs here and nowhere else: only this program runs as
+# root and is allowed to read the file in /etc. The caller learns nothing
+# about it beyond the exit code -- never what is in it. And to get exit 0 the
+# caller must have brought the content along itself anyway.
+#
+# NOTHING IS EVER OVERWRITTEN, not on differing content and not even when no
+# list entry exists for the file any more. This program cannot and must not
+# know the list: it lives in the calling user's HOME and is writable by them
+# -- rule 2 in the header. And the very same directories hold the
+# configurations placed there by hand, which NEVER had a list entry (the
+# rejection messages above point there explicitly). Those are exactly the
+# ones a "no entry, so away with it" would hit. The message names the way out
+# instead.
+#
+# 'cmp' is one more external command here -- unlike the chmod saved further
+# down it is worth it: bash builtins cannot compare byte for byte. A command
+# substitution throws trailing newlines away, and 'read -d ""' stops at the
+# first null byte and would report a file with appended null-byte garbage as
+# identical -- that is, wrongly in the dangerous direction.
+#
+# The tests are [ -L ] and then [ -f ], not [ -e ]: [ -e ] is true for EVERY
+# kind of target. If a FIFO sits there, 'cmp' above hangs in it indefinitely
+# -- bin/omarchy-vpn-add wraps no 'timeout' of its own around the pkexec
+# call, so the widget would stall until somebody kills the root process by
+# hand. [ -f ] cleanly steps around directory, device and FIFO: none of them
+# is a regular file, none ever reaches 'cmp'.
+#
+# A symlink to a regular file passes [ -f ] AS WELL -- the test follows the
+# link. That is why the symlink test comes first and stands on its own: every
+# symlink pointing at something that exists is rejected, EVEN when the file
+# behind it happens to be byte-identical right now. A comparison would only
+# check this instant -- the symlink itself would remain, the list entry would
+# come into being, and it points at a file outside this program whose content
+# could be changed at any time without re-authenticating (it typically lives
+# in the user's HOME, which they can write themselves). A DEAD symlink is
+# explicitly exempt: [ -e ] is false for it, it falls through both tests and
+# is replaced below by 'mv -f' with a real 0600 file in the perfectly regular
+# way (mv replaces the link instead of following it) -- that is the existing
+# and still desired resolution for an orphaned file, not a regression.
+if [ -L "$target" ] && [ -e "$target" ]; then
+  die 72 "target is a symlink: $target -- it could point at a file outside /etc whose content could be changed unnoticed and without re-authenticating. Remove it and pick the configuration again: sudo rm $target"
+fi
+
+if [ -e "$target" ]; then
+  # No longer a symlink (see above) and still not a regular file: a
+  # directory, a FIFO or a device. The message must NOT speak of "different
+  # content" here -- that would simply be false, there is no content to
+  # compare. 'sudo rm -r' instead of 'sudo rm', because a directory cannot be
+  # removed with the latter.
+  if [ ! -f "$target" ]; then
+    die 72 "target is not a regular file: $target -- no comparison possible. Remove it and pick the configuration again: sudo rm -r $target"
+  fi
+  if printf '%s\n' "$content" | cmp -s - "$target"; then
+    exit 0
+  fi
+  die 72 "file already exists with different content: $target -- a connection removed earlier via the cross leaves its file behind if 'also delete the file' was not ticked. Either pick a different label or remove the file: sudo rm $target"
+fi
+
+# Write atomically: first beside it, then rename. An aborted import must not
+# leave half a configuration behind that 'systemctl start' could pick up. No
+# separate chmod: thanks to 'umask 077' above, mktemp already creates the
+# file with 0600 -- an additional chmod call would only be one more external
+# command this root program depends on (and chmod is out of reach in the test
+# sandbox for good reason, see test/run-tests.sh).
+tmp="$(mktemp "$dir/.$name.XXXXXX")" || die 74 "could not create a temporary file in $dir"
+# On a signal in exactly this window (after mktemp, before mv), a temporary
+# file with key material would otherwise be left lying in /etc.
+trap 'rm -f "$tmp"' EXIT
+# The EXIT trap only cleans up. On a signal the script must also END: without
+# its own 'exit' it would carry on after the trap handler, create $tmp anew
+# and write the target after all (Review I8).
+trap 'rm -f "$tmp"; exit 74' INT TERM
+printf '%s\n' "$content" >"$tmp" || { rm -f "$tmp"; die 74 "could not write"; }
+mv -f "$tmp" "$target" || { rm -f "$tmp"; die 74 "could not create $target"; }
+exit 0

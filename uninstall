@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Deliberately almost a no-op. Neither the connection list nor the sudoers
+# entries nor the systemd units are touched -- they belong to the system,
+# not to this plugin.
+set -uo pipefail
+
+CONF="${OMARCHY_VPN_CONNECTIONS:-$HOME/.config/omarchy/vpn-connections.json}"
+cat <<EOF2
+Nothing to do. The connection list is kept:
+  $CONF
+
+Not removed, because they live outside this plugin:
+  /usr/local/bin/omarchy-vpn-privileged
+  /usr/local/bin/omarchy-vpn-import
+  /usr/share/polkit-1/actions/org.omarchy.smartalbvpn.import.policy
+  /etc/sudoers.d/smartalb-vpn
+  /etc/openvpn/client/*.conf and /etc/wireguard/*.conf
+Running connections keep running.
+
+Configurations created through the widget likewise stay behind in /etc.
+Whoever wants to be rid of them removes them through the widget itself
+before uninstalling (with 'also delete the file' ticked).
+
+Also not removed, but pointing nowhere afterwards: the entry
+  { "id": "smartalb.vpn" }
+under bar.layout.right in ~/.config/omarchy/shell.json. Remove it by hand,
+otherwise the bar keeps trying to load a plugin that is no longer there.
+EOF2

@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+# Prepares the smartalb.vpn plugin: make bin/ executable, create a sample
+# configuration and check the requirements.
+# Idempotent, may be run repeatedly.
+set -uo pipefail
+
+SILENT=false
+[ "${1:-}" = "--silent" ] && SILENT=true
+say() { [ "$SILENT" = true ] || printf '%s\n' "$*"; }
+
+DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+chmod +x "$DIR"/bin/* "$DIR"/share/* "$DIR/install" "$DIR/uninstall" "$DIR/test/run-tests.sh" 2>/dev/null
+
+CONF="${OMARCHY_VPN_CONNECTIONS:-$HOME/.config/omarchy/vpn-connections.json}"
+PRIV="${OMARCHY_VPN_PRIVILEGED:-/usr/local/bin/omarchy-vpn-privileged}"
+IMPORT="${OMARCHY_VPN_IMPORT:-/usr/local/bin/omarchy-vpn-import}"
+POLICY="${OMARCHY_VPN_POLICY:-/usr/share/polkit-1/actions/org.omarchy.smartalbvpn.import.policy}"
+
+HAVE_JQ=false
+command -v jq >/dev/null 2>&1 && HAVE_JQ=true
+
+if [ -f "$CONF" ]; then
+  # The same criteria as read_connections() in bin/_common.sh: valid JSON,
+  # an array, every element an object. install used to report "present,
+  # left unchanged" here without looking -- even for a broken file. The
+  # user then saw an empty popup later and went looking in the wrong place.
+  # On an error the file is NOT overwritten, it is the user's
+  # configuration -- only a clear warning with the path and what was
+  # expected.
+  if [ "$HAVE_JQ" = true ] && \
+     jq -e 'type == "array" and all(.[]; type == "object")' "$CONF" >/dev/null 2>&1; then
+    say "Configuration present, left unchanged: $CONF"
+  elif [ "$HAVE_JQ" = true ]; then
+    say "WARNING: configuration present, but invalid: $CONF"
+    say "         Expected is a JSON array of objects, e.g.:"
+    say '         [{ "id": "...", "label": "...", "unit": "...", "group": "..." }]'
+    say "         The file was NOT changed. Without a correction the panel"
+    say "         stays empty."
+  else
+    say "Configuration present, left unchanged: $CONF"
+    say "WARNING: jq missing -- the content could not be checked."
+  fi
+else
+  mkdir -p "$(dirname "$CONF")"
+  cat >"$CONF" <<'JSON'
+[]
+JSON
+  say "Configuration created: $CONF"
+  say "         Still empty -- you add connections through the widget"
+  say "         (open the panel, 'Add connection')."
+fi
+
+[ "$HAVE_JQ" = true ] || say "WARNING: jq missing -- without jq the panel stays empty."
+# 'timeout' has bounded every systemctl call in list and toggle since the
+# timeout exit code (6) was introduced -- by now a hard dependency, not
+# merely a convenience (review M10).
+command -v timeout >/dev/null 2>&1 || say "WARNING: timeout missing -- omarchy-vpn-list and omarchy-vpn-toggle need it."
+
+# Whether the helper program is installed can be answered without
+# executing anything -- unlike the question whether passwordless sudo is
+# set up. For that there is still no harmless probe: a call with a real
+# unit could actually bring the connection up, and '--dry-run' is,
+# according to man(1) systemctl, not provided for the 'start' verb.
+if [ -x "$PRIV" ]; then
+  say "Helper program present: $PRIV"
+
+  # That "present and executable" also means "the right file, with the
+  # right permissions, in a directory nobody else can write to" is what
+  # this step is for -- see the README, section Requirements.
+  if ! cmp -s "$DIR/share/omarchy-vpn-privileged" "$PRIV"; then
+    say "WARNING: $PRIV differs from the shipped share/omarchy-vpn-privileged"
+    say "         (outdated or modified). Repeat the install command:"
+    say ""
+    say "           sudo install -m 755 -o root -g root \\"
+    say "             \"$DIR/share/omarchy-vpn-privileged\" $PRIV"
+    say ""
+  fi
+
+  OWNER_MODE="$(stat -c '%U %a' "$PRIV" 2>/dev/null)"
+  if [ "$OWNER_MODE" != "root 755" ]; then
+    say "WARNING: $PRIV is not owned by root with mode 755 (found:"
+    say "         ${OWNER_MODE:-unknown}). A NOPASSWD rule on a file that is"
+    say "         not owned by root, or is writable too widely, is a root"
+    say "         shell. Correct it with:"
+    say "           sudo chown root:root $PRIV && sudo chmod 755 $PRIV"
+  fi
+
+  PRIVDIR="$(dirname "$PRIV")"
+  if [ -w "$PRIVDIR" ]; then
+    say "WARNING: $PRIVDIR is writable for this user."
+    say "         Even if $PRIV is owned by root, it can be replaced inside a"
+    say "         writable directory -- likewise a root shell. Check and"
+    say "         correct the directory permissions."
+  fi
+else
+  say "WARNING: helper program missing: $PRIV"
+  say "         Without it nothing can be switched. Once, as root:"
+  say ""
+  say "           sudo install -m 755 -o root -g root \\"
+  say "             \"$DIR/share/omarchy-vpn-privileged\" $PRIV"
+  say "           printf '%s ALL=(root) NOPASSWD: %s\\n' \"\$USER\" $PRIV \\"
+  say "             | sudo tee /tmp/smartalb-vpn.new >/dev/null"
+  say "           sudo visudo -c -f /tmp/smartalb-vpn.new"
+  say "           sudo install -m 440 -o root -g root /tmp/smartalb-vpn.new /etc/sudoers.d/smartalb-vpn"
+  say "           sudo rm -f /tmp/smartalb-vpn.new"
+  say "           sudo visudo -c"
+  say ""
+  say "         The order is deliberate: check the new line in a temporary"
+  say "         file first (visudo -c -f), and only then put it into"
+  say "         /etc/sudoers.d/. A typo written straight into the target"
+  say "         file would otherwise cripple every sudo on the machine"
+  say "         between the write and the correction."
+  say ""
+  say "         The helper program must be owned by root and must NOT be"
+  say "         writable for the user -- a NOPASSWD rule on a writable file"
+  say "         is a root shell. Hence into /usr/local/bin and not out of"
+  say "         the plugin directory."
+fi
+
+if [ -x "$IMPORT" ]; then
+  say "Import helper program present: $IMPORT"
+  [ -r "$POLICY" ] || say "WARNING: polkit action missing: $POLICY -- the password dialog then shows only the program path."
+else
+  say "WARNING: import helper program missing: $IMPORT"
+  say "         Without it no connections can be created through the"
+  say "         widget. Once, as root:"
+  say ""
+  say "           sudo install -m 755 -o root -g root \\"
+  say "             \"$DIR/share/omarchy-vpn-import\" $IMPORT"
+  say "           sudo install -m 644 -o root -g root \\"
+  say "             \"$DIR/share/omarchy-vpn-import.policy\" $POLICY"
+  say ""
+  say "         Unlike the switching program this one does NOT run without a"
+  say "         password: it writes into /etc, and a configuration placed"
+  say "         there is later executed with system privileges."
+fi
+
+command -v pkexec >/dev/null 2>&1 || \
+  say "WARNING: pkexec missing (package polkit) -- without it there is no password dialog."
+
+say "Note: whether passwordless sudo really works shows on the first"
+say "      switch -- omarchy-vpn-toggle then says so clearly."
+say "      For the setup see the README, section Installation, step 4."

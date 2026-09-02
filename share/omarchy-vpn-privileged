@@ -1,0 +1,70 @@
+#!/bin/bash -p
+# Switches exactly one VPN unit -- and nothing else.
+#
+# This program is the only piece of the plugin that runs as root. The
+# matching sudoers rule reads
+#
+#   <user> ALL=(root) NOPASSWD: /usr/local/bin/omarchy-vpn-privileged
+#
+# that is, WITHOUT any restriction on the arguments. The checks further
+# down are therefore the entire gate. Deliberately this way round: a check
+# written in code can be tested, a regular expression in sudoers cannot.
+#
+# TWO RULES that apply when changing this:
+#
+#   1. Read nothing from the environment. No ${VAR:-...}, no path taken
+#      from a variable. Everything that comes in from outside is an
+#      opportunity to make this program do something else -- as root. That
+#      is why the test suite runs a copy in which the SYSTEMCTL line below
+#      is textually replaced; see test/run-tests.sh, setup_sandbox().
+#      This expressly covers line 1 as well: "#!/usr/bin/env bash" would
+#      have the kernel start /usr/bin/env, and env looks for bash in the
+#      PATH -- the PATH of the calling user, which sudo passes through
+#      unchanged unless "Defaults secure_path" is set. Hence the fixed
+#      "#!/bin/bash -p": no PATH lookup, and "-p" (privileged mode)
+#      additionally ignores BASH_ENV, SHELLOPTS and inherited shell
+#      functions in case env_reset is switched off on the target system.
+#
+#   2. This file must not live anywhere the user can write to it. It is
+#      installed into /usr/local/bin/, root:root, 755; only that path is
+#      named in sudoers. A NOPASSWD rule pointing at a user-writable file
+#      would be a root shell.
+#
+# Usage: omarchy-vpn-privileged <start|stop> <unit>
+set -uo pipefail
+
+ME="${0##*/}"
+
+# Hard-wired, not redirectable -- see rule 1 above. The exact spelling of
+# this line is a contract: test/run-tests.sh replaces precisely it.
+SYSTEMCTL=/usr/bin/systemctl
+
+if [ $# -ne 2 ]; then
+  printf '%s: expected exactly two arguments: <start|stop> <unit>\n' "$ME" >&2
+  exit 64
+fi
+
+action="$1"
+unit="$2"
+
+case "$action" in
+  start|stop) ;;
+  *)
+    printf '%s: disallowed action: %s (allowed: start, stop)\n' "$ME" "$action" >&2
+    exit 65 ;;
+esac
+
+# A full match, not merely a prefix. Ruled out by it: foreign units, an
+# empty instance name, '/', spaces, newlines, ';' and every other piece of
+# punctuation, as well as options such as '--now' (they do not carry the
+# required prefix). A trailing '.service' is allowed: instance names may
+# contain dots, and 'wg-quick@x.service' names the same unit as
+# 'wg-quick@x'.
+if ! [[ "$unit" =~ ^(openvpn-client|wg-quick)@[A-Za-z0-9_.-]+$ ]]; then
+  printf '%s: disallowed unit name: %s\n' "$ME" "$unit" >&2
+  exit 66
+fi
+
+# exec, not a call: after the check this program has nothing left to do,
+# and systemctl's exit code reaches the caller unchanged.
+exec "$SYSTEMCTL" "$action" "$unit"

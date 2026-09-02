@@ -1,0 +1,501 @@
+#!/usr/bin/env bash
+# Judges a VPN configuration arriving on stdin and prints exactly one JSON
+# object. Needs no privileges -- it only reads what the user already holds in
+# their own hands.
+#
+# Its purpose is display: the UI shows the user what it recognized BEFORE the
+# password dialog appears. The binding check is done all over again by
+# share/omarchy-vpn-import itself -- a privileged program does not trust its
+# caller. That is why the rules stand twice in this code base; the parity
+# test in test/run-tests.sh is what holds them together.
+#
+# Always exits 0 as long as a verdict was possible; the verdict itself is in
+# the "ok" field. Like omarchy-vpn-list, this program emits valid JSON on
+# every path, so the UI never has to guess at empty or unexpectedly shaped
+# output.
+#
+# The content is never stored anywhere and never logged: a .ovpn file
+# contains the private key.
+set -uo pipefail
+
+# Character classes such as [A-Za-z] and [[:space:]] are locale-dependent:
+# under a UTF-8 locale they can match differently than under C (some composed
+# characters then count as word characters, for instance). This check relies
+# on exactly those classes in several places -- so the locale is pinned to C,
+# regardless of what the caller brings along in the environment.
+export LC_ALL=C
+
+emit_error() {
+  # $1 message, $2 line number (empty = none), $3 detected kind (empty = none)
+  if [ -n "${2:-}" ]; then
+    jq -n --arg e "$1" --argjson l "$2" --arg k "${3:-}" \
+      '{ok:false, error:$e, line:$l} + (if $k == "" then {} else {kind:$k} end)'
+  else
+    jq -n --arg e "$1" --arg k "${3:-}" \
+      '{ok:false, error:$e} + (if $k == "" then {} else {kind:$k} end)'
+  fi
+}
+
+if ! command -v jq >/dev/null 2>&1; then
+  # Without jq the message cannot be built with jq -- so build it by hand,
+  # just like omarchy-vpn-list does.
+  printf '{"ok":false,"error":"jq is not installed"}\n'
+  exit 0
+fi
+
+content="$(cat)"
+if [ -z "${content//[[:space:]]/}" ]; then
+  emit_error "input is empty" "" ""
+  exit 0
+fi
+
+# Normalized: exactly one trailing newline. share/omarchy-vpn-import writes
+# the file the very same way -- what is judged and what is written have to be
+# the same bytes.
+#
+# The .sha256 field below belongs to exactly that promise. The workflow
+# (bin/omarchy-vpn-add) no longer USES it -- it once secured a second read of
+# the clipboard, and that read is gone. It stays as evidence: a test holds it
+# against the file omarchy-vpn-import actually wrote, and turns red the
+# moment one of the two normalizations drifts away from the other.
+normalized="$(printf '%s\n' "$content")"
+
+# Determines the kind -- and does so BLOCK-AWARE, exactly like check_openvpn
+# below. An embedded <ca> block holds base64, not directives; if the string
+# "[Interface]" stood in there, the file would otherwise count as WireGuard
+# and check_openvpn would never run (Review I1). Kind detection is the switch
+# BEFORE the security check, not mere display.
+#
+# <connection> is -- as below -- NOT a skipped block here: its content is
+# real directives, 'remote' among them. A configuration whose only peer sits
+# inside a <connection> block is recognized as OpenVPN at all only because of
+# this.
+#
+# Leading whitespace is stripped before comparing: openvpn accepts indented
+# directives (verified against 2.7.6). Only one of the two versions used to
+# strip the indentation -- that was the single place where inspect and import
+# genuinely drifted apart (Review I2).
+detect_kind() {
+  local line inblock="" ovpn="" trimmed
+  while IFS= read -r line; do
+    # Strip the indentation FIRST, check for the marker SECOND. The order is
+    # not a matter of taste, it is imitation: openvpn strips first. The other
+    # way round, an indented closing marker ("<TAB></ca>") closed the block
+    # for openvpn but not for us -- everything after it counted as block
+    # content to us and was silently skipped, while openvpn evaluated it as a
+    # top-level directive. An ordinary <cert> block further down was enough
+    # to keep even the "never closed" fallback from catching it. Verified
+    # against 2.7.6.
+    line="${line#"${line%%[![:space:]]*}"}"
+
+    # Closing marker: openvpn ends the block as soon as a line BEGINS with
+    # "</tag>" -- trailing text does no harm ("</ca> trailing" and "</ca>x"
+    # both close, verified). We close on any "</" without comparing the tag;
+    # openvpn requires the tags to match ("</cb>" does not close there). That
+    # is deliberate: it can only make us stop skipping EARLIER than openvpn,
+    # never later -- and only "later" would be a hole.
+    case "$line" in
+      "</"*) inblock=""; continue ;;
+    esac
+
+    # Inside a block nothing is checked and nothing is read as a marker: that
+    # is where key material lives. This line deliberately stands BEFORE the
+    # opening marker -- exactly like openvpn, which inside a block looks for
+    # nothing but the closing marker.
+    [ -n "$inblock" ] && continue
+
+    # An opening marker only in the form openvpn accepts: the line must be
+    # EXACTLY "<tag>" -- no indentation, no trailing whitespace. "<ca>
+    # trailing", "<ca x>" and "x<ca>" are not markers to openvpn but unknown
+    # options that make it abort (verified against 2.7.6). We used to treat
+    # them as the start of a block -- the check then skipped lines openvpn
+    # would have evaluated. A line that falls through here ends up in the
+    # directive check below and is rejected as "Unexpected directive
+    # spelling" -- the same verdict openvpn reaches, only without relying
+    # on it.
+    trimmed="${line%"${line##*[![:space:]]}"}"
+    if [[ "$trimmed" =~ ^\<([A-Za-z][A-Za-z0-9_-]*)\>$ ]]; then
+      # For kind detection EVERY block is skipped, including one that
+      # check_openvpn rejects a moment later (<auth-user-pass>, say).
+      # Detection is the switch BEFORE the check: if it let the content of
+      # such a block count, an "[Interface]" hidden in there could declare
+      # the file a WireGuard configuration and check_openvpn would never run
+      # (Review I1).
+      case "${BASH_REMATCH[1]}" in connection) ;; *) inblock="${BASH_REMATCH[1]}" ;; esac
+      continue
+    fi
+    case "$line" in
+      *"[Interface]"*) printf 'wireguard'; return 0 ;;
+    esac
+    if [ -z "$ovpn" ]; then
+      case "$line" in
+        client|client\ *|remote\ *|dev\ tun*|dev\ tap*) ovpn=1 ;;
+      esac
+    fi
+  done <<<"$1"
+  [ -n "$ovpn" ] && printf 'openvpn'
+  return 0
+}
+
+kind="$(detect_kind "$normalized")"
+if [ -z "$kind" ]; then
+  emit_error "No OpenVPN or WireGuard configuration recognized (expected: '[Interface]' or 'client'/'remote')" "" ""
+  exit 0
+fi
+
+violation=""
+violation_line=""
+
+# Truncates a token to at most 24 characters and appends "..." when it does
+# (three separate periods, no special character). Keeps key material out of
+# error messages -- for instance a base64 line that sits outside a
+# <ca>/<cert>/<key> block (because the block markers were lost while copying,
+# say) and looks like an unexpected directive spelling. The same function
+# stands for the same reason in share/omarchy-vpn-import; the parity test
+# holds the two together.
+trunc() {
+  local s="$1" max=24
+  if [ "${#s}" -gt "$max" ]; then
+    printf '%s...' "${s:0:$max}"
+  else
+    printf '%s' "$s"
+  fi
+}
+
+# Normalizes the spelling of an option name. openvpn also accepts directives
+# with a leading '--' and in quotes: '--up', '"up"' and "'up'" are all the
+# same as 'up' to openvpn (verified against 2.7.6). Without this
+# normalization the allowlist would turn away valid spellings -- and any
+# later denylist could be evaded through exactly this gap. The word as it
+# stands in the file is left untouched for the message.
+normalize_word() {
+  local w="$1"
+  w="${w%\"}"; w="${w#\"}"
+  w="${w%\'}"; w="${w#\'}"
+  w="${w#--}"
+  w="${w%\"}"; w="${w#\"}"
+  w="${w%\'}"; w="${w#\'}"
+  printf '%s' "$w"
+}
+
+# --- OpenVPN allowlist ---
+#
+# What is enumerated is what is ALLOWED, not what would be forbidden. Three
+# denylist versions failed at the very same point: openvpn 2.7.6 knows 297
+# directives, and a denylist only protects against what somebody read
+# beforehand. The last two it missed were 'http-proxy-user-pass <file>'
+# (openvpn reads the file as root and sends its beginning base64-encoded to
+# the proxy) and 'dev-node unix:<program>' ("OpenVPN will start the program",
+# with no script-security at all). Both are documented as accepted by 2.7.6.
+#
+# Included is what a SELF-CONTAINED client configuration needs: peer,
+# protocol, device, encryption and negotiation, certificate verification,
+# timing and retry behavior, message verbosity, routing. Included is NOTHING
+# that reads or writes a file, starts a program, opens a control channel or
+# switches into server mode. Every single entry was checked against the
+# openvpn 2.7.6 man page for exactly those four effects.
+#
+# Three entries that are not self-evident:
+#   - 'route', 'route-*' and 'redirect-gateway' change the routing -- which
+#     is precisely what a VPN is for. They execute no code and read no file;
+#     'iproute' (which routes via a PROGRAM) is consistently absent.
+#   - 'pull-filter' and 'ignore-unknown-option' can only TAKE AWAY: the one
+#     discards options pushed by the server, the other makes unknown
+#     directives non-fatal. Neither can add anything.
+#   - 'block-outside-dns' does not exist in openvpn on Linux at all; it is
+#     here because commercial providers ship it as 'setenv opt
+#     block-outside-dns' and the line would otherwise turn away a valid
+#     configuration.
+#
+# A directive newly added in some future openvpn version is not on the list
+# and gets rejected -- when in doubt too strict, never too lax. That is the
+# right direction for a gate with something running as root behind it.
+#
+# Word for word identical in bin/omarchy-vpn-inspect and
+# share/omarchy-vpn-import; the parity test in test/run-tests.sh holds the
+# two together.
+allowed_openvpn() {
+  case "$1" in
+    allow-compression|auth|auth-nocache|auth-retry|bind|\
+    block-outside-dns|cipher|client|comp-lzo|comp-noadapt|\
+    compat-mode|compress|connect-retry|connect-retry-max|\
+    connect-timeout|data-ciphers|data-ciphers-fallback|dev|dev-type|\
+    dhcp-option|disable-dco|disable-occ|dns|ecdh-curve|\
+    explicit-exit-notify|fast-io|float|fragment|group|hand-window|\
+    ignore-unknown-option|inactive|keepalive|key-direction|link-mtu|\
+    local|lport|max-packet-size|mssfix|mtu-disc|mute|\
+    mute-replay-warnings|ncp-ciphers|ncp-disable|nobind|ns-cert-type|\
+    passtos|peer-fingerprint|persist-key|persist-local-ip|\
+    persist-remote-ip|persist-tun|ping|ping-exit|ping-restart|\
+    ping-timer-rem|port|proto|proto-force|pull|pull-filter|\
+    push-peer-info|rcvbuf|redirect-gateway|redirect-private|remote|\
+    remote-cert-eku|remote-cert-ku|remote-cert-tls|remote-random|\
+    remote-random-hostname|reneg-bytes|reneg-pkts|reneg-sec|\
+    replay-window|resolv-retry|route|route-delay|route-gateway|\
+    route-ipv6|route-ipv6-gateway|route-metric|route-noexec|\
+    route-nopull|route-table|rport|server-poll-timeout|setenv|\
+    setenv-safe|shaper|sndbuf|tcp-nodelay|tls-cert-profile|\
+    tls-cipher|tls-ciphersuites|tls-client|tls-groups|tls-timeout|\
+    tls-version-max|tls-version-min|topology|tran-window|tun-mtu|\
+    tun-mtu-extra|tun-mtu-max|txqueuelen|up-delay|user|verb|\
+    verify-hash|\
+    verify-x509-name|x509-username-field)
+      return 0 ;;
+  esac
+  return 1
+}
+
+# The message says the directive is not on the LIST -- not that it is
+# forbidden. The difference matters: most rejected directives are harmless
+# and are missing only because nobody has needed them yet. And it names the
+# way around, the one the spec explicitly requires: place the file by hand
+# into /etc/openvpn/client/.
+not_allowed_msg() {
+  printf 'Directive is not on the allowlist: %s -- that does not classify it as dangerous, it is merely missing. If you need it, place the file by hand into /etc/openvpn/client/.' "$(trunc "$1")"
+}
+
+# Credentials are missing from the list like everything else -- but here the
+# reason can be named, so it is named: a systemd unit has nobody it could ask
+# for a password, and there is no secret store (out of scope per the spec).
+# The way around is stated here too: this is the most frequent rejection, and
+# without it the user ends up at a dead end.
+credentials_msg() {
+  printf 'Credentials are not supported: %s -- a systemd unit has nobody it could ask for them. If you need them, place the file by hand into /etc/openvpn/client/.' "$(trunc "$1")"
+}
+
+check_openvpn() {
+  local n=0 line word rest cword inblock="" tag inner trimmed
+  local -a parts
+  while IFS= read -r line; do
+    n=$((n + 1))
+    # Skip embedded blocks: that is where key material lives. How a block
+    # marker is read is the most delicate spot of this whole check -- five of
+    # the findings so far were not about directive names but about what
+    # happens before them, in taking the line apart. The rule the three
+    # sections below obey: OUR ORDER MUST MATCH OPENVPN'S. And where it
+    # differs, only in one direction -- we may stop skipping earlier than
+    # openvpn, never later.
+    #
+    # <connection> blocks are EXEMPT from this skipping: unlike
+    # <ca>/<cert>/<key> they hold no key data but real directives. Their
+    # content is therefore checked just like the top level.
+    #
+    # It used to be skipped, on this reasoning: inside a <connection> block
+    # openvpn allows only a fixed, small option list of its own (bind,
+    # connect-retry, connect-retry-max, connect-timeout,
+    # explicit-exit-notify, float, fragment, http-proxy, http-proxy-option,
+    # key-direction, link-mtu, local, lport, mssfix, mtu-disc, nobind, port,
+    # proto, remote, rport, socks-proxy, tls-auth, tls-crypt, tls-crypt-v2,
+    # tun-mtu, tun-mtu-extra -- source:
+    # doc/man-sections/connection-profiles.rst in the openvpn repo). For the
+    # CODE-EXECUTING directives that holds and stays true: openvpn rejects
+    # 'up' there with "option 'up' cannot be used in this context
+    # ([CONNECTION-OPTIONS])" (verified against 2.7.6).
+    #
+    # For the FILE-POINTING ones it does NOT hold -- http-proxy, socks-proxy,
+    # tls-auth, tls-crypt and tls-crypt-v2 are themselves on that option
+    # list. 'tls-auth <path>' inside the block loads the file ("Cannot
+    # pre-load keyfile", verified), and 'http-proxy <host> <port> <file>'
+    # makes openvpn read it as root and send its beginning to a peer of the
+    # attacker's choosing. So the skipping really was a second way around
+    # (Review C2).
+
+    # Strip the indentation FIRST, check for the marker SECOND. The order is
+    # not a matter of taste, it is imitation: openvpn strips first. The other
+    # way round, an indented closing marker ("<TAB></ca>") closed the block
+    # for openvpn but not for us -- everything after it counted as block
+    # content to us and was silently skipped, while openvpn evaluated it as a
+    # top-level directive. An ordinary <cert> block further down was enough
+    # to keep even the "never closed" fallback from catching it. Verified
+    # against 2.7.6.
+    line="${line#"${line%%[![:space:]]*}"}"
+
+    # Closing marker: openvpn ends the block as soon as a line BEGINS with
+    # "</tag>" -- trailing text does no harm ("</ca> trailing" and "</ca>x"
+    # both close, verified). We close on any "</" without comparing the tag;
+    # openvpn requires the tags to match ("</cb>" does not close there). That
+    # is deliberate: it can only make us stop skipping EARLIER than openvpn,
+    # never later -- and only "later" would be a hole.
+    case "$line" in
+      "</"*) inblock=""; continue ;;
+    esac
+
+    # Inside a block nothing is checked and nothing is read as a marker: that
+    # is where key material lives. This line deliberately stands BEFORE the
+    # opening marker -- exactly like openvpn, which inside a block looks for
+    # nothing but the closing marker.
+    [ -n "$inblock" ] && continue
+
+    # An opening marker only in the form openvpn accepts: the line must be
+    # EXACTLY "<tag>" -- no indentation, no trailing whitespace. "<ca>
+    # trailing", "<ca x>" and "x<ca>" are not markers to openvpn but unknown
+    # options that make it abort (verified against 2.7.6). We used to treat
+    # them as the start of a block -- the check then skipped lines openvpn
+    # would have evaluated. A line that falls through here ends up in the
+    # directive check below and is rejected as "Unexpected directive
+    # spelling" -- the same verdict openvpn reaches, only without relying
+    # on it.
+    trimmed="${line%"${line##*[![:space:]]}"}"
+    if [[ "$trimmed" =~ ^\<([A-Za-z][A-Za-z0-9_-]*)\>$ ]]; then
+      tag="${BASH_REMATCH[1]}"
+      # Only what is REALLY key material gets skipped. It used to be that
+      # EVERY <tag> block was skipped -- and openvpn can inline more than
+      # keys: '<auth-user-pass>user/password</auth-user-pass>' is a valid
+      # configuration (verified against 2.7.6) and used to drop the cleartext
+      # password into /etc/openvpn/client/, while the very same thing written
+      # as a directive was rejected. The same goes for
+      # '<http-proxy-user-pass>' and '<auth-gen-token-secret>'.
+      #
+      # The man page names 15 inline-capable options (section INLINE FILE
+      # SUPPORT) -- and is not complete for all that. Sending all 297
+      # directives inline one by one, 2.7.6 additionally accepts twelve that
+      # are not named there: 'compat-mode', 'disable-dco',
+      # 'ifconfig-ipv6-push', 'iroute', 'iroute-ipv6', 'max-routes',
+      # 'override-username', 'prng', 'providers', 'push-remove',
+      # 'route-ipv6-gateway', 'secret'. With '<providers>' openvpn will even
+      # load an OpenSSL library. That is exactly why the default "every
+      # unknown block is rejected" is the right one -- it covered those
+      # twelve without anyone having to know them beforehand. What stands
+      # here is only what a self-contained client configuration really needs
+      # -- the same rule as for the directives, one level up. Everything else
+      # is judged like a directive and so falls through the allowlist.
+      #
+      # Code cannot get in by this route: openvpn itself rejects '<up>',
+      # '<plugin>', '<script-security>', '<config>', '<log>' and '<dev-node>'
+      # with "option 'X' is not expected to be inline" (verified). We reject
+      # them ourselves anyway rather than rely on that.
+      case "$tag" in
+        connection) ;;
+        ca|cert|key|dh|extra-certs|pkcs12|crl-verify|tls-auth|tls-crypt|\
+        tls-crypt-v2|peer-fingerprint|verify-hash) inblock="$tag" ;;
+        auth-user-pass|askpass|static-challenge)
+          violation="$(credentials_msg "<$tag>")"
+          violation_line="$n"; return ;;
+        *)
+          violation="$(not_allowed_msg "<$tag>")"
+          violation_line="$n"; return ;;
+      esac
+      continue
+    fi
+
+    case "$line" in ""|"#"*|";"*) continue ;; esac
+    word="${line%%[[:space:]]*}"
+    rest="${line#"$word"}"
+    rest="${rest#"${rest%%[![:space:]]*}"}"
+
+    cword="$(normalize_word "$word")"
+
+    # After normalization an option name has to be left over. Anything else
+    # is a spelling we cannot judge -- and what we cannot judge, we do not
+    # let through (this also catches variants nobody thought of beforehand,
+    # e.g. 'u"p"' or '---up').
+    if ! [[ "$cword" =~ ^[A-Za-z][A-Za-z0-9-]*$ ]]; then
+      violation="Unexpected directive spelling: $(trunc "$word")"
+      violation_line="$n"; return
+    fi
+
+    # 'setenv opt <directive>' is NOT a variable assignment but a prefix:
+    # openvpn strikes the two words and processes the rest as a perfectly
+    # ordinary directive. Documented against 2.7.6 -- 'setenv opt up /tmp/x'
+    # fails with "--up script fails with '/tmp/x'", word for word the same as
+    # 'up /tmp/x'. Without this spot, 'setenv' on the allowlist would be a
+    # master key for everything that is not on it. A second prefix does not
+    # work: openvpn silently drops 'setenv opt setenv opt up' (it reports
+    # 'setenv' as unknown, and the prefix makes that report non-fatal) -- the
+    # inner directive is never executed. So no recursion is needed. 'setenv'
+    # still has to stay on the list: the providers ship 'setenv opt
+    # block-outside-dns' by the million.
+    if [ "$cword" = "setenv" ]; then
+      read -r -a parts <<<"$rest"
+      # openvpn compares 'opt' in lowercase ('setenv OPT up ...' is an
+      # ordinary variable, verified). Here deliberately case-insensitive:
+      # the check may be stricter than openvpn, never laxer.
+      if [ "$(printf '%s' "${parts[0]:-}" | tr 'A-Z' 'a-z')" = "opt" ]; then
+        inner="$(normalize_word "${parts[1]:-}")"
+        if ! [[ "$inner" =~ ^[A-Za-z][A-Za-z0-9-]*$ ]]; then
+          violation="Unexpected directive spelling: $(trunc "${parts[1]:-setenv opt}")"
+          violation_line="$n"; return
+        fi
+        if ! allowed_openvpn "$inner"; then
+          violation="setenv opt: $(not_allowed_msg "${parts[1]}")"
+          violation_line="$n"; return
+        fi
+        continue
+      fi
+    fi
+
+    case "$cword" in
+      auth-user-pass|askpass|static-challenge)
+        violation="$(credentials_msg "$word")"
+        violation_line="$n"; return ;;
+    esac
+
+    if ! allowed_openvpn "$cword"; then
+      violation="$(not_allowed_msg "$word")"
+      violation_line="$n"; return
+    fi
+  done <<<"$1"
+
+  if [ -n "$inblock" ]; then
+    violation="Embedded block <$(trunc "$inblock")> was never closed"
+    violation_line="$n"
+  fi
+}
+
+check_wireguard() {
+  local n=0 line word
+  while IFS= read -r line; do
+    n=$((n + 1))
+    line="${line#"${line%%[![:space:]]*}"}"
+    case "$line" in ""|"#"*) continue ;; esac
+    word="${line%%[[:space:]=]*}"
+    case "$(printf '%s' "$word" | tr 'A-Z' 'a-z')" in
+      postup|preup|postdown|predown)
+        violation="Directive executes code as root: $(trunc "$word")"
+        violation_line="$n"; return ;;
+    esac
+  done <<<"$1"
+}
+
+if [ "$kind" = "openvpn" ]; then check_openvpn "$normalized"; else check_wireguard "$normalized"; fi
+
+if [ -n "$violation" ]; then
+  emit_error "$violation" "$violation_line" "$kind"
+  exit 0
+fi
+
+remote=""
+if [ "$kind" = "openvpn" ]; then
+  while IFS= read -r line; do
+    case "${line#"${line%%[![:space:]]*}"}" in
+      remote\ *)
+        set -- ${line#*remote }
+        remote="${1:-}"
+        [ -n "${2:-}" ] && remote="$remote:$2"
+        break ;;
+    esac
+  done <<<"$normalized"
+else
+  while IFS= read -r line; do
+    case "$(printf '%s' "$line" | tr 'A-Z' 'a-z')" in
+      endpoint*=*) remote="${line#*=}"; remote="${remote#"${remote%%[![:space:]]*}"}"; break ;;
+    esac
+  done <<<"$normalized"
+fi
+
+embedded=false
+case "$normalized" in
+  *"<ca>"*) case "$normalized" in *"<key>"*) embedded=true ;; esac ;;
+esac
+
+sha="$(printf '%s\n' "$content" | sha256sum | cut -d' ' -f1)"
+bytes="$(printf '%s\n' "$content" | wc -c | tr -d ' ')"
+
+if [ "$kind" = "openvpn" ]; then
+  jq -n --arg k "$kind" --arg r "$remote" --argjson e "$embedded" \
+        --arg s "$sha" --argjson b "$bytes" \
+    '{ok:true, kind:$k, remote:$r, embedded:$e, sha256:$s, bytes:$b}'
+else
+  jq -n --arg k "$kind" --arg r "$remote" --arg s "$sha" --argjson b "$bytes" \
+    '{ok:true, kind:$k, remote:$r, sha256:$s, bytes:$b}'
+fi

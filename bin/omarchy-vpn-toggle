@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+# Toggles a VPN connection: if it is up, it gets stopped; if it is not, it
+# gets started -- after other active connections of the same group have been
+# stopped.
+# Usage: omarchy-vpn-toggle <connection-id>
+set -uo pipefail
+
+SELF_DIR="$(dirname "$(readlink -f "$0")")"
+. "$SELF_DIR/_common.sh"
+
+ME="$(basename "$0")"
+need_jq
+
+# SYSTEMCTL_TIMEOUT comes from _common.sh (shared with unit_state() and
+# unit_needs_stop_for_group(), see there). Necessary because not every unit
+# has an upper bound of its own: wg-quick@<name> reports
+# TimeoutStartUSec=infinity, so a hanging 'wg-quick up' would block
+# indefinitely -- and the panel locks its rows for as long as the call runs.
+
+if [ $# -lt 1 ] || [ -z "${1:-}" ]; then
+  echo "Usage: $ME <connection-id>" >&2
+  exit 1
+fi
+target="$1"
+
+if ! conns="$(read_connections)"; then
+  echo "$ME: connection list not readable: $CONNECTIONS_FILE" >&2
+  exit 5
+fi
+
+entry="$(printf '%s' "$conns" | jq -c --arg id "$target" 'map(select(.id == $id)) | .[0] // empty')"
+if [ -z "$entry" ]; then
+  echo "$ME: unknown connection: $target" >&2
+  exit 2
+fi
+
+unit="$(printf '%s' "$entry" | jq -r '.unit // ""')"
+group="$(printf '%s' "$entry" | jq -r '.group // ""')"
+
+# A missing or empty 'unit' is a configuration error, not a usage error and
+# not an unknown connection: the id was found, only the entry is
+# incomplete. Without this check 'jq -r .unit' would return the STRING
+# "null" for a missing field and 'systemctl start null' would be run -- the
+# sudoers allowlist then refuses it with "a password is required", which
+# points at the wrong suspect (review I4). Exit 5 instead of a new code:
+# the same category as an unreadable configuration file, except that here
+# the file is readable and a single entry inside it is faulty -- see the
+# README/spec on exit 5.
+if [ -z "$unit" ]; then
+  echo "$ME: connection '$target' has no 'unit' in $CONNECTIONS_FILE -- check the configuration" >&2
+  exit 5
+fi
+
+# Passes systemd's last line of error output through. Without it the user
+# faces a connection that did not come up, with no hint at all as to why.
+# 'timeout' catches the case where the call never returns -- not every unit
+# bounds itself (see SYSTEMCTL_TIMEOUT in _common.sh). The return value 124
+# is the convention of 'timeout' for exactly that case and is passed on to
+# the caller unchanged.
+#
+# Deliberately WITHOUT '--' before the unit: the helper program's second
+# argument is the unit name, which it checks exactly against
+# ^(openvpn-client|wg-quick)@[A-Za-z0-9_.-]+$. A '--' in front of it would
+# shift everything by one and be rejected as a disallowed action (exit 65).
+#
+# The call goes through share/omarchy-vpn-privileged instead of straight to
+# systemctl: that way sudoers needs only a single line with no restriction
+# on the arguments, and a new connection is nothing more than an entry in
+# vpn-connections.json -- no more root intervention. If the helper program
+# refuses (exit 64/65/66), its plain-text line reaches the user through the
+# tail -n1 below.
+run_systemctl() {
+  local action="$1" u="$2" out rc
+  out="$(timeout "$SYSTEMCTL_TIMEOUT" sudo -n "$VPN_PRIVILEGED" "$action" "$u" 2>&1)"
+  rc=$?
+  if [ "$rc" -eq 124 ]; then
+    printf '%s: systemctl %s %s timed out after %ss -- it may have kept running in the background: %s\n' \
+      "$ME" "$action" "$u" "$SYSTEMCTL_TIMEOUT" "$(printf '%s' "$out" | tail -n1)" >&2
+    return 124
+  fi
+  if [ "$rc" -ne 0 ]; then
+    printf '%s: systemctl %s %s failed: %s\n' \
+      "$ME" "$action" "$u" "$(printf '%s' "$out" | tail -n1)" >&2
+    return 1
+  fi
+}
+
+# Runs run_systemctl and ends the script with the matching code on failure.
+# A timeout gets an exit code of its own (6) instead of 4: it is not an
+# ordinary failure of systemd, it only means that the call did not return in
+# time -- with 'start' the unit may still come up in the background
+# afterwards. Whoever evaluates the exit codes should be able to tell the
+# two apart without parsing the message.
+require_systemctl() {
+  local rc
+  run_systemctl "$@"
+  rc=$?
+  [ "$rc" -eq 0 ] && return 0
+  [ "$rc" -eq 124 ] && exit 6
+  exit 4
+}
+
+# A state of 'failed' deliberately does not count as running: a click on it
+# should restart it, not stop something that is already down.
+if [ "$(unit_state "$unit")" = "active" ]; then
+  require_systemctl stop "$unit"
+  exit 0
+fi
+
+# Group partners first. If one of them fails, nothing is started -- otherwise
+# two tunnels of the same group would be up, and the shared stop could no
+# longer tell them apart.
+#
+# unit_needs_stop_for_group() instead of unit_state() = "active":
+# unit_state() folds 'activating' into 'inactive', and
+# openvpn-client@.service (Type=notify, TimeoutStartUSec=90s) sits at
+# 'activating' for the whole duration of establishing the connection. With
+# the old comparison a slowly starting partner was not stopped -- two
+# tunnels of the same group were running (review C1).
+if [ -n "$group" ]; then
+  while IFS= read -r other; do
+    [ -n "$other" ] || continue
+    [ "$other" = "$unit" ] && continue
+    unit_needs_stop_for_group "$other" || continue
+    require_systemctl stop "$other"
+  done < <(printf '%s' "$conns" | jq -r --arg g "$group" '.[] | select((.group // "") == $g) | .unit')
+fi
+
+require_systemctl start "$unit"

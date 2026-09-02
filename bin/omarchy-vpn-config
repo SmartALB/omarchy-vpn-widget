@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# Maintains the connection list ~/.config/omarchy/vpn-connections.json.
+# Needs no privileges: the file belongs to the user.
+#
+# Usage: omarchy-vpn-config add <id> <label> <unit> [group]
+#        omarchy-vpn-config remove <id>
+set -uo pipefail
+
+SELF_DIR="$(dirname "$(readlink -f "$0")")"
+. "$SELF_DIR/_common.sh"
+
+ME="$(basename "$0")"
+need_jq
+
+usage() {
+  echo "Usage: $ME add <id> <label> <unit> [group]" >&2
+  echo "       $ME remove <id>" >&2
+  exit 1
+}
+
+action="${1:-}"
+case "$action" in
+  add)    [ $# -ge 4 ] && [ $# -le 5 ] || usage ;;
+  remove) [ $# -eq 2 ] || usage ;;
+  *)      usage ;;
+esac
+
+# Read the existing list. A missing file is an empty array here -- unlike in
+# read_connections(), where it means an error: there the list is being read,
+# here it is being created. A broken file remains an error in both cases; it
+# is the user's configuration and does not get overwritten.
+if [ -e "$CONNECTIONS_FILE" ]; then
+  if ! jq -e 'type == "array" and all(.[]; type == "object")' "$CONNECTIONS_FILE" >/dev/null 2>&1; then
+    echo "$ME: connection list is invalid, it will not be changed: $CONNECTIONS_FILE" >&2
+    exit 5
+  fi
+  current="$(jq -c . "$CONNECTIONS_FILE")"
+else
+  current='[]'
+fi
+
+if [ "$action" = "add" ]; then
+  id="$2"; label="$3"; unit="$4"; group="${5:-}"
+  if [ -z "$id" ] || [ -z "$unit" ]; then usage; fi
+  if printf '%s' "$current" | jq -e --arg id "$id" 'any(.[]; .id == $id)' >/dev/null; then
+    echo "$ME: id already exists: $id" >&2
+    exit 2
+  fi
+  updated="$(printf '%s' "$current" | jq --arg id "$id" --arg label "$label" \
+      --arg unit "$unit" --arg group "$group" \
+      '. + [ {id:$id, label:$label, unit:$unit}
+             + (if $group == "" then {} else {group:$group} end) ]')" \
+    || { echo "$ME: could not build the entry" >&2; exit 5; }
+else
+  id="$2"
+  updated="$(printf '%s' "$current" | jq --arg id "$id" 'map(select(.id != $id))')" \
+    || { echo "$ME: could not remove the entry" >&2; exit 5; }
+fi
+
+# Atomic: write beside it first, then rename. An interrupted write must not
+# leave half a list behind -- the panel would end up empty, and
+# omarchy-vpn-list would report "not readable".
+dir="$(dirname "$CONNECTIONS_FILE")"
+mkdir -p "$dir" || { echo "$ME: could not create $dir" >&2; exit 5; }
+tmp="$(mktemp "$dir/.vpn-connections.XXXXXX")" || { echo "$ME: no temporary file" >&2; exit 5; }
+printf '%s\n' "$updated" | jq . >"$tmp" || { rm -f "$tmp"; echo "$ME: could not write" >&2; exit 5; }
+mv -f "$tmp" "$CONNECTIONS_FILE" || { rm -f "$tmp"; echo "$ME: could not replace" >&2; exit 5; }

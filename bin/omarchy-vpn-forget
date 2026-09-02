@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Removes a connection: first from the list, then -- only with --also-file --
+# the configuration file in /etc.
+#
+# The reverse order of creating, and for the same reason: if deleting the
+# file fails, the connection has already vanished from the bar and the file
+# is still lying there. That is the less harmful of the two half-states.
+#
+# Without --also-file no pkexec runs: taking an entry out of the list has
+# no consequences and should not cost a password.
+#
+# The option name --also-file is an interface shared with Panel.qml and
+# with test/run-tests.sh: it appears in bin/omarchy-vpn-forget (5 places),
+# in Panel.qml (1) and in the test suite (2). Renaming it in only some of
+# them breaks the delete path in the panel silently -- forget rejects the
+# unknown option with exit 1, and the list entry is then never removed at
+# all.
+#
+# Usage: omarchy-vpn-forget <id> <unit> [--also-file]
+set -uo pipefail
+
+SELF_DIR="$(dirname "$(readlink -f "$0")")"
+. "$SELF_DIR/_common.sh"
+
+ME="$(basename "$0")"
+
+if [ $# -lt 2 ] || [ $# -gt 3 ] || [ -z "${1:-}" ] || [ -z "${2:-}" ]; then
+  echo "Usage: $ME <id> <unit> [--also-file]" >&2
+  exit 1
+fi
+id="$1"; unit="$2"; also="${3:-}"
+if [ -n "$also" ] && [ "$also" != "--also-file" ]; then
+  echo "Usage: $ME <id> <unit> [--also-file]" >&2
+  exit 1
+fi
+
+"$SELF_DIR/omarchy-vpn-config" remove "$id" || exit 15
+[ "$also" = "--also-file" ] || exit 0
+
+case "$unit" in
+  wg-quick@*)       kind="wireguard"; name="${unit#wg-quick@}" ;;
+  openvpn-client@*) kind="openvpn";   name="${unit#openvpn-client@}" ;;
+  *) echo "$ME: unknown unit shape, the file stays where it is: $unit" >&2; exit 16 ;;
+esac
+
+out="$(pkexec "$IMPORT_BIN" remove "$kind" "$name" 2>&1)"
+rc=$?
+if [ "$rc" -ne 0 ]; then
+  printf '%s: entry removed, the file stayed behind: %s\n' "$ME" "$(printf '%s' "$out" | tail -n1)" >&2
+  exit 16
+fi

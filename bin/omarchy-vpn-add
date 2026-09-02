@@ -1,0 +1,218 @@
+#!/usr/bin/env bash
+# Creates a connection from a configuration file: first the configuration
+# file in /etc (through pkexec, with a password dialog), then the entry in
+# the list.
+#
+# THE ORDER IS THE CONTRACT. Never the other way round: a list entry
+# without a configuration file would be a connection that shows up in the
+# bar and fails when clicked. The other way round the half-state is
+# harmless -- a file in /etc that nobody knows about.
+#
+# Likewise: rejection happens BEFORE the password dialog. Nobody should
+# have to type their password only to be told afterwards that the input was
+# unusable.
+#
+# THE FILE IS READ HERE, AS THE USER -- and only its content goes through
+# the pipe to the privileged program. The path is NEVER handed to it: it
+# runs as root and could use the path to import a file the user is not
+# allowed to read at all (say /etc/shadow or another user's .ovpn).
+#
+# Read exactly ONCE, and the very same content goes to both the check and
+# the import. That is why no fingerprint is needed any more: the comparison
+# that used to be necessary only existed because the clipboard was read
+# twice and could change in between.
+#
+# The content is never stored and never logged anywhere -- an .ovpn
+# contains the private key. The PATH on the other hand is harmless and may
+# appear in error messages.
+#
+# Usage: omarchy-vpn-add <path> <label> [group]
+#
+# Exit codes:
+#    0  created
+#    1  usage error (wrong number of arguments, empty argument)
+#    3  jq missing (from need_jq)
+#   10  input file unusable -- not found, a directory, not readable or
+#       empty. Four cases, ONE code, but four different messages: they tell
+#       the user what it was, and the tests pin each check down by its
+#       message (the same pattern as the three label checks under 12).
+#   11  omarchy-vpn-inspect rejects the content (before the password dialog)
+#   12  label does not yield a usable name (three checks)
+#   13  password dialog cancelled or authorization denied
+#   14  omarchy-vpn-import failed. Its last message line is passed through
+#       unchanged -- among them the one for exit 72 ("file already exists
+#       with different content"), which explains to the user why a name can
+#       be taken even though they just removed that connection, and names
+#       both ways out. It is a SINGLE LINE, and it has to stay that way:
+#       the 'tail -n1' below would cut off everything before it (and
+#       Panel.qml likewise shows only the last line).
+#   15  entry in the connection list failed
+#
+# 16 has been retired (obsolete fingerprint) and is not reassigned -- a
+# reused code would mean something else in old notes than it does here.
+set -uo pipefail
+
+SELF_DIR="$(dirname "$(readlink -f "$0")")"
+. "$SELF_DIR/_common.sh"
+
+ME="$(basename "$0")"
+need_jq
+
+if [ $# -lt 2 ] || [ $# -gt 3 ] || [ -z "${1:-}" ] || [ -z "${2:-}" ]; then
+  echo "Usage: $ME <path> <label> [group]" >&2
+  exit 1
+fi
+path="$1"; label="$2"; group="${3:-}"
+
+# Four checks on the input file, in this order and with four different
+# messages. The order is not arbitrary:
+#
+#   * '-e' first, so that a typo in the path does not show up as "not
+#     readable". A symlink into nowhere deliberately falls under this one --
+#     for the user that is the same as "does not exist".
+#   * '-d' BEFORE '-r': a directory is as a rule readable for the user, so
+#     the '-r' check would let it through, and only 'cat' would fail -- with
+#     empty content and therefore the wrong message ("is empty").
+#   * '-r' before reading, so that "no read permission" is reported as such
+#     and not as an empty file.
+#   * "empty" last, on the content actually read -- and, as in
+#     omarchy-vpn-inspect and omarchy-vpn-import, against whitespace-ONLY,
+#     not merely against zero bytes.
+if [ ! -e "$path" ]; then
+  echo "$ME: file not found: $path" >&2
+  exit 10
+fi
+if [ -d "$path" ]; then
+  echo "$ME: that is a directory, not a configuration file: $path" >&2
+  exit 10
+fi
+if [ ! -r "$path" ]; then
+  echo "$ME: file not readable (no read permission): $path" >&2
+  exit 10
+fi
+
+# Read as the USER, not as root -- see the header comment. '--' and 'cat'
+# instead of a redirection, so that a path with a leading '-' is not read as
+# an option.
+content="$(cat -- "$path" 2>/dev/null)"
+if [ -z "${content//[[:space:]]/}" ]; then
+  echo "$ME: file is empty: $path" >&2
+  exit 10
+fi
+
+verdict="$(printf '%s\n' "$content" | "$SELF_DIR/omarchy-vpn-inspect")"
+if [ "$(printf '%s' "$verdict" | jq -r '.ok')" != "true" ]; then
+  line="$(printf '%s' "$verdict" | jq -r '.line // empty')"
+  err="$(printf '%s' "$verdict" | jq -r '.error // "unusable input"')"
+  if [ -n "$line" ]; then echo "$ME: line $line: $err" >&2; else echo "$ME: $err" >&2; fi
+  exit 11
+fi
+kind="$(printf '%s' "$verdict" | jq -r '.kind')"
+
+# The label becomes the name: file name, unit instance and id in one. The
+# same character set that omarchy-vpn-privileged accepts when switching.
+#
+# THREE rejection checks on one and the same name, deliberately not
+# redundant -- each catches a different way in which nothing but
+# replacement characters (or nothing at all) could be left in the end:
+#
+#  1. On the RAW, UNTRUNCATED label: catches a label such as "///" that
+#     contains NO allowed character AT ALL -- independent of maxlen and of
+#     leading '-'.
+#  2. On the slice of the label that actually survives into $name (see
+#     below): catches a label whose only allowed character lies BEYOND
+#     maxlen and is dropped by the truncation.
+#  3. On the finished $name (empty/"."/".."): catches cases that only
+#     become visible after the FULL processing, e.g. a label made entirely
+#     of '-', which disappears completely when leading '-' are stripped.
+#
+# Check 1 comes first because it does not need maxlen.
+#
+# The three messages are DELIBERATELY worded differently. They tell the
+# user WHAT it was (no usable character / lost in truncation / empty only
+# after processing) -- and they are the only externally visible trait by
+# which the three checks can be pinned down individually. With three
+# identically worded messages, check 1 could be deleted outright without
+# turning a single test red (review I5): check 2 works on a slice of $label
+# and also catches every label that already fails check 1 -- just with a
+# different reason.
+case "$label" in
+  *[A-Za-z0-9_.-]*) ;;
+  *)
+    echo "$ME: label contains no usable character: $label" >&2
+    exit 12 ;;
+esac
+case "$kind" in wireguard) maxlen=15 ;; *) maxlen=64 ;; esac
+
+# Check 2: NOT simply "${label:0:$maxlen}" (fix round 1, minor 1) -- that
+# ignores that between this point and the truncation below the leading '-'
+# are still stripped. '-' is itself an allowed character, so it passes
+# check 1 without objection, but is removed afterwards -- which shifts the
+# actual truncation window to the right by the number k of leading '-'
+# (fix round 2, reviewer finding: the label "-" + 20 spaces + "a" passed
+# the old check 2 under WireGuard but yielded name="_______________").
+# Hence: determine k first (on a copy, so that $label itself stays
+# untouched) and check "${label:k:maxlen}" -- the substitution below works
+# character by character, 1:1 (one byte becomes exactly one byte), so the
+# positions stay aligned, and only '-' maps onto '-'. If the label itself
+# yields no allowed character within that shifted window, it is lost in the
+# truncation.
+without_leading_dashes="$label"
+while [ "${without_leading_dashes#-}" != "$without_leading_dashes" ]; do
+  without_leading_dashes="${without_leading_dashes#-}"
+done
+k=$(( ${#label} - ${#without_leading_dashes} ))
+case "${label:k:maxlen}" in
+  *[A-Za-z0-9_.-]*) ;;
+  *)
+    echo "$ME: label: the usable character is lost when truncating to $maxlen characters: $label" >&2
+    exit 12 ;;
+esac
+
+name="${label//[^A-Za-z0-9_.-]/_}"
+while [ "${name#-}" != "$name" ]; do name="${name#-}"; done   # drop leading '-'
+name="${name:0:$maxlen}"
+# Check 3: catches what only becomes visible after the full processing,
+# e.g. a label made entirely of '-' (it passes checks 1 and 2, because '-'
+# is an allowed character -- but disappears completely when stripped).
+if [ -z "$name" ] || [ "$name" = "." ] || [ "$name" = ".." ]; then
+  echo "$ME: label yields no valid name after processing: $label" >&2
+  exit 12
+fi
+
+case "$kind" in
+  wireguard) unit="wg-quick@$name" ;;
+  *)         unit="openvpn-client@$name" ;;
+esac
+
+# Only the CONTENT goes across, never $path -- see the header comment.
+#
+# If a BYTE-IDENTICAL file of that name already exists in /etc, the import
+# ends successfully without writing -- and the list entry below is created
+# all the same. That is the way back from a connection that was removed
+# earlier without "also delete the file". Whether a
+# comparison or a write happened is NOT known at this point, and should not
+# be: the comparison happens inside the privileged program, which may read
+# the file as root, and nothing but the exit code escapes from there.
+out="$(printf '%s\n' "$content" | pkexec "$IMPORT_BIN" add "$kind" "$name" 2>&1)"
+rc=$?
+# pkexec returns 126 both for a dismissed password dialog and for denied
+# authorization (too many wrong passwords, policy forbids it) -- in both
+# cases "Cancelled" covers the case without having to tell them apart here.
+# The split between 13 (here) and 14 (below, "import failed") rests on
+# share/omarchy-vpn-import itself never exiting with 126 -- that exit code
+# is reserved by pkexec and is not used by any "die" call over there.
+if [ "$rc" -eq 126 ]; then
+  echo "$ME: Cancelled" >&2
+  exit 13
+fi
+if [ "$rc" -ne 0 ]; then
+  printf '%s: %s\n' "$ME" "$(printf '%s' "$out" | tail -n1)" >&2
+  exit 14
+fi
+
+if [ -n "$group" ]; then
+  "$SELF_DIR/omarchy-vpn-config" add "$name" "$label" "$unit" "$group" || exit 15
+else
+  "$SELF_DIR/omarchy-vpn-config" add "$name" "$label" "$unit" || exit 15
+fi
