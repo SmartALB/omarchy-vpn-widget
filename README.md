@@ -119,11 +119,20 @@ sudo install -m 644 -o root -g root \
   /usr/share/polkit-1/actions/org.omarchy.smartalbvpn.import.policy
 ```
 
-The sudoers line is deliberately checked in a temporary file first
-(`visudo -c -f`) and only then moved into place, not the other way round.
-Write straight into the target file and check afterwards, and a typo would
-cripple **every** `sudo` on the machine for the window between writing and
-fixing -- you would lock yourself out.
+The sudoers line is checked before it is moved into place, not afterwards:
+written straight into the target and checked after, a typo would cripple
+**every** `sudo` on the machine for the window in between -- including the
+one needed to repair it.
+
+**Prefer `./install --system` to typing these.** The commands above have a
+weakness that the marketplace security review pointed out, and it is real:
+the scratch file in `/tmp` belongs to you between the `visudo` check and the
+`install`, so a process running as you can swap it in that moment and have a
+sudoers rule of its own making installed. The detour guards against a typo;
+it never guarded against an attacker. `--system` closes that by doing the
+whole privileged part inside a single root process, from a staging directory
+only root can reach, and by binding the rule to your numeric user id rather
+than to a login name.
 
 Without the first program nothing can be switched; without the second no
 connection can be created or its file removed. Rerun `./install` to see

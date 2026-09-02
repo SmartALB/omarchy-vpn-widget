@@ -17,7 +17,7 @@ Panel {
   // A second copy of what manifest.json says -- QML cannot reach the
   // manifest (Omarchy's PluginRegistry is an instance, not a singleton).
   // test_panel_version_matches_the_manifest keeps the two from drifting.
-  readonly property string pluginVersion: "1.2.2"
+  readonly property string pluginVersion: "1.3.0"
 
   property var connections: []
   property string loadError: ""

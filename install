@@ -177,58 +177,105 @@ if [ "${FAKE_EUID:-$(id -u)}" = "0" ]; then
   exit 1
 fi
 
-# Puts SRC at DST, if it is not already byte-identical there. Returns 0 if
-# something was done, 1 if it was already current -- the caller does not
-# evaluate that, it only reports.
-put() {
-  local src="$1" dst="$2" mode="$3" what="$4"
-  if cmp -s "$src" "$dst" 2>/dev/null; then
-    say "already current: $dst"
-    return 1
-  fi
-  say "installing $what -> $dst"
-  sudo install -m "$mode" -o root -g root "$src" "$dst" || {
-    say "FAILED: could not install $dst"
-    exit 1
-  }
-}
+# Everything privileged happens in ONE root process, and it is handed the
+# reviewed bytes rather than a path.
+#
+# The marketplace security review found the previous shape wanting, rightly.
+# It validated a sudoers file in /tmp with one sudo call and installed it
+# with the next -- and between the two the file belonged to the user. A
+# process under the same uid could swap it and have an arbitrary NOPASSWD
+# rule published. The scratch file guarded against a typo; it never guarded
+# against an attacker, it created the opening.
+#
+# The same held for the programs: root reopened them from the plugin
+# directory, which the user can write. What a reviewer had read and what
+# root published were not necessarily the same bytes.
+#
+# So: the payload travels through the pipe, root unpacks it into a directory
+# of its own that nobody else can reach, and validates and publishes from
+# there. Nothing under $DIR is named to sudo at all.
+uid="$(id -u 2>/dev/null)"
+case "${uid:-}" in
+  ''|*[!0-9]*) say "FAILED: could not determine a numeric user id"; exit 1 ;;
+esac
 
-# The order is a contract. The program goes in FIRST, the rule that points
-# at it second. The other way round leaves, if the copy fails, a rule
-# pointing at nothing -- and sudo does not treat a rule whose program it
-# cannot resolve as matching, so the missing program then looks like a
-# missing permission. That cost an hour on the laptop.
-put "$DIR/share/omarchy-vpn-privileged" "$PRIV" 755 "the switching program"
+for f in omarchy-vpn-privileged omarchy-vpn-import omarchy-vpn-import.policy; do
+  [ -r "$DIR/share/$f" ] || { say "FAILED: missing: share/$f"; exit 1; }
+done
 
-# id -un, not $USER: the variable can be stale or unset (a lean environment,
-# a service context), and a sudoers line naming the wrong user grants the
-# permission to somebody else and none to the person switching. $USER only
-# as a fallback.
-me="$(id -un 2>/dev/null || printf '%s' "${USER:-}")"
-[ -n "$me" ] || { say "FAILED: could not determine the user name"; exit 1; }
-line="$me ALL=(root) NOPASSWD: $PRIV"
-if [ -f "$SUDOERS" ] && grep -Fxq "$line" "$SUDOERS" 2>/dev/null; then
-  say "already current: $SUDOERS"
-else
-  # The detour through a scratch file is the point, not a formality: written
-  # straight into the target and checked afterwards, a faulty line would
-  # cripple EVERY sudo on the machine for the window in between -- including
-  # the one needed to repair it.
-  tmp="$(mktemp -t smartalb-vpn.XXXXXX)" || { say "FAILED: no scratch file"; exit 1; }
-  printf '%s\n' "$line" >"$tmp"
-  if ! sudo visudo -c -f "$tmp" >/dev/null; then
-    rm -f "$tmp"
-    say "FAILED: the generated sudoers line was rejected -- nothing was changed."
-    exit 1
-  fi
-  say "installing the sudoers rule -> $SUDOERS"
-  sudo install -m 440 -o root -g root "$tmp" "$SUDOERS" || {
-    rm -f "$tmp"; say "FAILED: could not install $SUDOERS"; exit 1
-  }
-  rm -f "$tmp"
+# The rule binds '#<uid>', not a login name. A name is text that sudoers
+# interprets -- an account called 'ALL' would change what the rule means.
+tar -C "$DIR/share" -cf - \
+      omarchy-vpn-privileged omarchy-vpn-import omarchy-vpn-import.policy 2>/dev/null \
+  | sudo env VPN_UID="$uid" VPN_PRIV="$PRIV" VPN_IMPORT="$IMPORT" \
+         VPN_POLICY="$POLICY" VPN_SUDOERS="$SUDOERS" bash -c '
+set -uo pipefail
+umask 077
+
+case "${VPN_UID:-}" in ''"''"''|*[!0-9]*) echo "root: uid is not numeric" >&2; exit 1 ;; esac
+for v in VPN_PRIV VPN_IMPORT VPN_POLICY VPN_SUDOERS; do
+  case "${!v}" in /*) ;; *) echo "root: $v is not an absolute path" >&2; exit 1 ;; esac
+done
+
+# mktemp -d already creates with mode 0700, owned by root -- no chmod, and
+# nothing but root can reach what is staged here.
+stage="$(mktemp -d)" || { echo "root: no staging directory" >&2; exit 1; }
+trap '"'"'rm -rf "$stage"'"'"' EXIT
+tar -C "$stage" -xf - || { echo "root: could not unpack the payload" >&2; exit 1; }
+
+for f in omarchy-vpn-privileged omarchy-vpn-import omarchy-vpn-import.policy; do
+  [ -f "$stage/$f" ] && [ ! -L "$stage/$f" ] || { echo "root: payload incomplete: $f" >&2; exit 1; }
+done
+
+printf "#%s ALL=(root) NOPASSWD: %s\n" "$VPN_UID" "$VPN_PRIV" >"$stage/sudoers"
+if ! visudo -c -f "$stage/sudoers" >/dev/null; then
+  echo "root: the generated sudoers rule was rejected -- nothing was changed" >&2
+  exit 1
 fi
 
-put "$DIR/share/omarchy-vpn-import" "$IMPORT" 755 "the import program"
-put "$DIR/share/omarchy-vpn-import.policy" "$POLICY" 644 "the polkit action"
+# Publication, one destination at a time. Before overwriting, the old
+# content is kept so an interrupted run can be undone; a destination that
+# is not a plain file is refused rather than replaced.
+undo=()
+restore() {
+  local i
+  for ((i=${#undo[@]}-1; i>=0; i--)); do
+    set -- ${undo[i]}
+    case "$1" in
+      keep) install -m "$4" -o root -g root "$2" "$3" 2>/dev/null || true ;;
+      drop) rm -f "$3" 2>/dev/null || true ;;
+    esac
+  done
+}
+publish() {
+  local src="$1" dst="$2" mode="$3" n oldmode
+  n="${dst##*/}"
+  if [ -e "$dst" ] || [ -L "$dst" ]; then
+    # A destination that is not a plain file is refused, not replaced: a
+    # symlink there would send the write somewhere else entirely.
+    [ -f "$dst" ] && [ ! -L "$dst" ] || { echo "root: $dst is not a plain file" >&2; return 1; }
+    if cmp -s "$src" "$dst"; then echo "already current: $dst"; return 0; fi
+    oldmode="$(stat -c %a "$dst" 2>/dev/null)" || return 1
+    cat "$dst" >"$stage/backup.$n" || return 1
+    undo+=("keep $stage/backup.$n $dst ${oldmode:-$mode}")
+  else
+    undo+=("drop - $dst -")
+  fi
+  echo "installing $dst"
+  # Written beside the destination and moved onto it: a reader sees either
+  # the old file or the new one, never half of either.
+  install -m "$mode" -o root -g root "$src" "$dst.new.$$" || return 1
+  mv -f "$dst.new.$$" "$dst" || { rm -f "$dst.new.$$"; return 1; }
+}
+
+# Grant last: the program has to be in place before the rule that points at
+# it. The other way round leaves a rule pointing at nothing -- and sudo does
+# not treat a rule whose program it cannot resolve as matching, so a missing
+# program presents itself as a missing permission.
+publish "$stage/omarchy-vpn-privileged"   "$VPN_PRIV"   755 || { restore; exit 1; }
+publish "$stage/omarchy-vpn-import"       "$VPN_IMPORT" 755 || { restore; exit 1; }
+publish "$stage/omarchy-vpn-import.policy" "$VPN_POLICY" 644 || { restore; exit 1; }
+publish "$stage/sudoers"                  "$VPN_SUDOERS" 440 || { restore; exit 1; }
+' || { say "FAILED: the privileged step did not complete -- nothing was left half done."; exit 1; }
 
 say "System part done. If the widget is running: omarchy-restart-shell"

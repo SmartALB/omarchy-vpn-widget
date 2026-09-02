@@ -104,7 +104,14 @@ fi
 # happens only after the allowlist, further down. The reason is stated
 # there.
 
-content="$(cat)"
+# A configuration is a few kilobytes; with embedded certificates a few tens
+# of them. Anything past a megabyte is not a configuration, and reading it
+# whole into a shell variable is exactly the wrong way to find that out.
+# Read the limit PLUS ONE byte: if the extra byte arrived, there was more
+# than we accept, and nothing further is done with it.
+MAX_BYTES=1048576
+content="$(head -c $((MAX_BYTES + 1)))"
+[ "${#content}" -le "$MAX_BYTES" ] || die 73 "input too large: more than $MAX_BYTES bytes"
 [ -n "${content//[[:space:]]/}" ] || die 73 "input is empty"
 # Normalized: exactly one trailing newline -- WORD FOR WORD the same as
 # bin/omarchy-vpn-inspect. A command substitution would throw it away again

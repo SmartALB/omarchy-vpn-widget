@@ -43,7 +43,17 @@ if ! command -v jq >/dev/null 2>&1; then
   exit 0
 fi
 
-content="$(cat)"
+# A configuration is a few kilobytes; with embedded certificates a few tens
+# of them. Anything past a megabyte is not a configuration, and reading it
+# whole into a shell variable is exactly the wrong way to find that out.
+# Read the limit PLUS ONE byte: if the extra byte arrived, there was more
+# than we accept, and nothing further is done with it.
+MAX_BYTES=1048576
+content="$(head -c $((MAX_BYTES + 1)))"
+if [ "${#content}" -gt "$MAX_BYTES" ]; then
+  printf '{"ok":false,"error":"input too large: more than %s bytes"}\n' "$MAX_BYTES"
+  exit 0
+fi
 if [ -z "${content//[[:space:]]/}" ]; then
   emit_error "input is empty" "" ""
   exit 0

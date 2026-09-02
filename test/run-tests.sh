@@ -51,7 +51,7 @@ setup_sandbox() {
   mkdir -p "$SANDBOX/sysbin"
   local tool
   local toolpath
-  for tool in bash jq sed grep tail head cut cat mktemp mv rm mkdir basename dirname readlink env printf sort ln timeout sleep cmp stat sha256sum wc tr find mkfifo install id; do
+  for tool in bash jq sed grep tail head cut cat mktemp mv rm mkdir basename dirname readlink env printf sort ln timeout sleep cmp stat sha256sum wc tr find mkfifo install id tar; do
     toolpath="$(command -v "$tool" 2>/dev/null)"
     if [ -n "$toolpath" ]; then
       ln -sf "$toolpath" "$SANDBOX/sysbin/$tool"
@@ -96,27 +96,14 @@ STUB
 
   cat >"$SANDBOX/stub/sudo" <<STUB
 #!/usr/bin/env bash
-printf '%s\n' "\$*" >>"$SANDBOX/sudo.log"
+# One line per invocation: the argument list can itself be a whole script,
+# and a raw dump would make a single call look like fifty.
+printf '%s\n' "\${*//$'\\n'/ }" >>"$SANDBOX/sudo.log"
 # Swallows -n and runs the rest directly -- or refuses.
 [ "\${1:-}" = "-n" ] && shift
 if [ -e "$SANDBOX/sudo-denies" ]; then
   echo "sudo: a password is required" >&2
   exit 1
-fi
-# The stub runs the command, it does not confer privilege. 'install -o root
-# -g root' would therefore fail on the ownership change, and the caller
-# would see a failure that only exists because we are not root. The two
-# options are dropped for that reason -- mode and content, which the tests
-# do check, stay untouched.
-if [ "\${1:-}" = "install" ]; then
-  args=(); shift
-  while [ \$# -gt 0 ]; do
-    case "\$1" in
-      -o|-g) shift 2 ;;
-      *) args+=("\$1"); shift ;;
-    esac
-  done
-  exec install "\${args[@]}"
 fi
 exec "\$@"
 STUB
@@ -125,6 +112,24 @@ STUB
   # be given a file it accepts; here the verdict is switchable, because what
   # matters is what 'install --system' does with a REJECTION -- it must not
   # put the file into place.
+  # The sandbox cannot confer privilege: 'install -o root -g root' would fail
+  # on the ownership change, and the caller would see a failure that exists
+  # only because we are not root. This stub drops the two options and passes
+  # everything else through -- mode and content, which the tests do check,
+  # stay untouched. It sits in stub/, ahead of sysbin/ in PATH, so it also
+  # applies inside a script that sudo starts.
+  cat >"$SANDBOX/stub/install" <<STUB
+#!/usr/bin/env bash
+args=()
+while [ \$# -gt 0 ]; do
+  case "\$1" in
+    -o|-g) shift 2 ;;
+    *) args+=("\$1"); shift ;;
+  esac
+done
+exec "$SANDBOX/sysbin/install" "\${args[@]}"
+STUB
+
   cat >"$SANDBOX/stub/visudo" <<STUB
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >>"$SANDBOX/visudo.log"
@@ -3596,21 +3601,117 @@ test_uninstall_rejects_unknown_argument() {
 # In the sandbox nothing privileged happens: 'sudo' and 'visudo' are stubs,
 # and all four target paths are redirected through the environment.
 
+# The security review found the input unbounded at every boundary: the
+# panel pipes a file into inspect, omarchy-vpn-add keeps the whole thing,
+# and the privileged importer did content="$(cat)" before any size check.
+# A configuration is a few kilobytes; anything past a megabyte is not one.
+# The limit has to bite in BOTH programs independently -- the importer
+# cannot rely on having been fed by our own panel.
+test_inspect_rejects_oversized_input() {
+  local out
+  out="$(head -c 1200000 /dev/zero | tr '\0' 'a' | "$BIN/omarchy-vpn-inspect")"
+  assert_eq "$(printf '%s' "$out" | jq -r '.ok')" "false"
+  assert_contains "$(printf '%s' "$out" | jq -r '.error')" "too large"
+}
+
+test_import_rejects_oversized_input() {
+  local rc=0 err
+  err="$(head -c 1200000 /dev/zero | tr '\0' 'a' \
+         | "$SANDBOX/priv/omarchy-vpn-import" add openvpn Big 2>&1)" || rc=$?
+  assert_eq "$rc" "73"
+  assert_contains "$err" "too large"
+  [ ! -e "$SANDBOX/etc/openvpn/client/Big.conf" ] || fail "an oversized input was written anyway"
+}
+
+# ... and a configuration of ordinary size still passes, so the limit is a
+# limit and not a wall.
+test_inspect_accepts_a_normal_configuration() {
+  local out
+  out="$(ovpn_ok | "$BIN/omarchy-vpn-inspect")"
+  assert_eq "$(printf '%s' "$out" | jq -r '.ok')" "true"
+}
+
+# --- What the marketplace security review asked for ---------------------
+#
+# The review found the privileged publication reopening user-writable state.
+# Between "sudo visudo -c -f /tmp/x" and "sudo install /tmp/x", the file
+# belongs to the user: a process under the same uid can swap it, and an
+# arbitrary NOPASSWD rule gets installed. The detour through a scratch file
+# guards against a TYPO, never against an attacker -- it created the window.
+#
+# The four tests below encode what replaced it. They are structural: they
+# read what the program hands to sudo, because a race cannot be provoked
+# reliably in a test suite. Structure is what can be held.
+
+# One privileged invocation, not five. Every additional one is another
+# moment in which the world can change between check and use.
+test_install_system_elevates_exactly_once() {
+  "$PLUGIN_DIR/install" --system >/dev/null 2>&1
+  local n
+  n="$(grep -c . "$SANDBOX/sudo.log" 2>/dev/null || echo 0)"
+  [ "$n" = "1" ] || fail "expected a single sudo invocation, got $n" "$(cat "$SANDBOX/sudo.log")"
+}
+
+# Nothing under the plugin directory may be named to sudo. The reviewed
+# bytes are handed over, not a path that root reopens afterwards -- the
+# checkout is user-writable, so a path is an invitation to swap.
+test_install_system_hands_root_no_plugin_path() {
+  "$PLUGIN_DIR/install" --system >/dev/null 2>&1
+  if grep -q -- "$PLUGIN_DIR" "$SANDBOX/sudo.log" 2>/dev/null; then
+    fail "a path inside the plugin directory was passed to sudo" "$(cat "$SANDBOX/sudo.log")"
+  fi
+}
+
+# The sudoers subject is the numeric uid. A login name is text that sudoers
+# interprets: an account called 'ALL' would change what the rule means.
+test_install_system_binds_the_numeric_uid() {
+  "$PLUGIN_DIR/install" --system >/dev/null 2>&1
+  [ -f "$OMARCHY_VPN_SUDOERS" ] || fail "no sudoers file was written"
+  local body; body="$(cat "$OMARCHY_VPN_SUDOERS")"
+  case "$body" in
+    "#$(id -u) ALL=(root) NOPASSWD: "*) ;;
+    *) fail "the rule does not bind the numeric uid" "$body" ;;
+  esac
+  case "$body" in
+    *"$(id -un)"*) fail "the login name appears in the rule" "$body" ;;
+  esac
+}
+
+# If the grant cannot be published, what was already replaced goes back.
+# Otherwise an interrupted run leaves a half-updated privileged program
+# behind with no rule, or an old rule pointing at a new binary.
+test_install_system_rolls_back_when_the_grant_fails() {
+  seed_system_artefacts
+  printf 'the previous helper\n' >"$OMARCHY_VPN_PRIVILEGED"
+  printf 'the previous importer\n' >"$OMARCHY_VPN_IMPORT"
+  # The grant must fail AFTER publication has begun, not before. Letting
+  # visudo reject the rule aborts ahead of the first write, so nothing needs
+  # undoing and the test would pass without a rollback existing at all --
+  # which is exactly what a mutation probe caught. An unreachable
+  # destination fails at the last of the four writes instead.
+  export OMARCHY_VPN_SUDOERS="$SANDBOX/no-such-dir/smartalb-vpn"
+  "$PLUGIN_DIR/install" --system >/dev/null 2>&1
+  [ ! -e "$OMARCHY_VPN_SUDOERS" ] || fail "the grant was published although its directory is missing"
+  assert_eq "$(cat "$OMARCHY_VPN_PRIVILEGED")" "the previous helper"
+  assert_eq "$(cat "$OMARCHY_VPN_IMPORT")" "the previous importer"
+}
+
 # The order is a contract, not a preference. If the sudoers file goes in
 # first and installing the program then fails, a rule stands that points at
 # nothing -- and that is exactly the state which cost an hour on the laptop,
 # because sudo does not treat a rule whose program it cannot resolve as
 # matching, so a missing program looks like a missing permission.
 test_install_system_installs_program_before_sudoers_rule() {
-  "$PLUGIN_DIR/install" --system >/dev/null 2>&1
-  local log priv_line sudoers_line
-  log="$SANDBOX/sudo.log"
-  [ -f "$log" ] || fail "install --system called no sudo at all"
-  priv_line="$(grep -n "omarchy-vpn-privileged" "$log" | head -n1 | cut -d: -f1)"
-  sudoers_line="$(grep -n "$OMARCHY_VPN_SUDOERS" "$log" | head -n1 | cut -d: -f1)"
-  [ -n "$priv_line" ]    || fail "the switching program was never installed" "$(cat "$log")"
-  [ -n "$sudoers_line" ] || fail "the sudoers file was never installed" "$(cat "$log")"
-  [ "$priv_line" -lt "$sudoers_line" ] ||     fail "the sudoers rule was put in place before the program it points at" "$(cat "$log")"
+  local out priv_line rule_line
+  out="$("$PLUGIN_DIR/install" --system 2>&1)"
+  # Measured on what the program reports, not on how it called sudo: there
+  # is only one call now, and the order lives inside it.
+  priv_line="$(printf '%s\n' "$out" | grep -n "installing $OMARCHY_VPN_PRIVILEGED\$" | head -n1 | cut -d: -f1)"
+  rule_line="$(printf '%s\n' "$out" | grep -n "installing $OMARCHY_VPN_SUDOERS\$" | head -n1 | cut -d: -f1)"
+  [ -n "$priv_line" ] || fail "the switching program was never installed" "$out"
+  [ -n "$rule_line" ] || fail "the sudoers rule was never installed" "$out"
+  [ "$priv_line" -lt "$rule_line" ] || \
+    fail "the sudoers rule was put in place before the program it points at" "$out"
 }
 
 # A rejected sudoers file must not reach its destination -- that is the whole
@@ -3633,23 +3734,27 @@ test_install_system_leaves_no_scratch_file_after_rejection() {
   : >"$SANDBOX/visudo-rejects"
   "$PLUGIN_DIR/install" --system >/dev/null 2>&1
   local scratch
-  scratch="$(grep -o "/[^ ]*smartalb-vpn[^ ]*" "$SANDBOX/visudo.log" 2>/dev/null | head -n1)"
+  # The path is read back out of the visudo log rather than guessed. Under
+  # the old shape it lay in the user's /tmp and could be swapped between the
+  # check and the install; it now lives in root's own staging directory and
+  # has to be gone afterwards either way.
+  scratch="$(sed -n 's/.*-f \(\/[^ ]*\).*/\1/p' "$SANDBOX/visudo.log" 2>/dev/null | head -n1)"
   [ -n "$scratch" ] || \
-    fail "visudo was never handed a scratch file -- the check was skipped" \
+    fail "visudo was never handed a file -- the check was skipped" \
          "$(cat "$SANDBOX/visudo.log" 2>/dev/null)"
-  [ ! -e "$scratch" ] || fail "the scratch file was left behind" "$scratch"
+  [ ! -e "$scratch" ] || fail "the staged file was left behind" "$scratch"
 }
 
 # Repeatable: a second run over an unchanged system installs nothing again.
 # This is what makes the command usable as the routine after a plugin update.
 test_install_system_is_idempotent() {
   "$PLUGIN_DIR/install" --system >/dev/null 2>&1
-  : >"$SANDBOX/sudo.log"
   local out
   out="$("$PLUGIN_DIR/install" --system 2>&1)"
-  if grep -q "omarchy-vpn-privileged" "$SANDBOX/sudo.log"; then
-    fail "an unchanged program was installed a second time" "$(cat "$SANDBOX/sudo.log")"
-  fi
+  case "$out" in
+    *"installing $OMARCHY_VPN_PRIVILEGED"*)
+      fail "an unchanged program was installed a second time" "$out" ;;
+  esac
   assert_contains "$out" "already current"
 }
 
@@ -3945,9 +4050,13 @@ test_install_warns_about_writable_helper_directory() {
 
 # --------------------------------------------------------------- Runner
 
+# An optional argument narrows the run to matching test names -- useful when
+# one test is being worked on and the other two hundred are noise.
+#   ./test/run-tests.sh install_system
 main() {
-  local t
+  local t pattern="${1:-}"
   for t in $(declare -F | awk '{print $3}' | grep '^test_' | sort); do
+    [ -z "$pattern" ] || case "$t" in *"$pattern"*) ;; *) continue ;; esac
     run_test "$t"
   done
   printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
