@@ -56,6 +56,24 @@ still missing. It changes nothing outside your own home directory.
 **4. Install the two helper programs, as root.**
 
 ```bash
+./install --system
+```
+
+That performs the four steps below, asks for the password once, and can be
+repeated: what is already in place and identical it leaves alone, what is
+out of date it replaces. It refuses to run as root -- under `sudo` the
+sudoers line would name root instead of you.
+
+The order in it is a contract: the program goes in **first**, the rule that
+points at it second. The other way round leaves, if the copy fails, a rule
+pointing at nothing -- and `sudo` does not treat a rule whose program it
+cannot resolve as matching, so a missing program then presents itself as a
+missing permission.
+
+The same by hand, which is what `--system` does and what it is worth having
+read once:
+
+```bash
 sudo install -m 755 -o root -g root \
   ~/.config/omarchy/plugins/smartalb.vpn/share/omarchy-vpn-privileged \
   /usr/local/bin/omarchy-vpn-privileged
@@ -114,9 +132,10 @@ cmp -s share/omarchy-vpn-privileged /usr/local/bin/omarchy-vpn-privileged || ech
 cmp -s share/omarchy-vpn-import     /usr/local/bin/omarchy-vpn-import     || echo "omarchy-vpn-import is out of date"
 ```
 
-Reinstall with the two `install` commands from step 4. This matters for
-`omarchy-vpn-import` in particular: it decides what may be written into
-`/etc`, so a fix in it only takes effect once the copy has been replaced.
+Or simply run `./install --system` again: it replaces exactly what differs
+and leaves the rest alone. This matters for `omarchy-vpn-import` in
+particular: it decides what may be written into `/etc`, so a fix in it only
+takes effect once the copy has been replaced.
 
 
 ## Requirements

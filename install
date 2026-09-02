@@ -5,7 +5,14 @@
 set -uo pipefail
 
 SILENT=false
-[ "${1:-}" = "--silent" ] && SILENT=true
+SYSTEM=false
+for arg in "$@"; do
+  case "$arg" in
+    --silent) SILENT=true ;;
+    --system) SYSTEM=true ;;
+    *) printf 'Usage: %s [--silent] [--system]\n' "$0" >&2; exit 64 ;;
+  esac
+done
 say() { [ "$SILENT" = true ] || printf '%s\n' "$*"; }
 
 DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
@@ -20,6 +27,7 @@ CONF="${OMARCHY_VPN_CONNECTIONS:-$HOME/.config/omarchy/vpn-connections.json}"
 PRIV="${OMARCHY_VPN_PRIVILEGED:-/usr/local/bin/omarchy-vpn-privileged}"
 IMPORT="${OMARCHY_VPN_IMPORT:-/usr/local/bin/omarchy-vpn-import}"
 POLICY="${OMARCHY_VPN_POLICY:-/usr/share/polkit-1/actions/org.omarchy.smartalbvpn.import.policy}"
+SUDOERS="${OMARCHY_VPN_SUDOERS:-/etc/sudoers.d/smartalb-vpn}"
 
 HAVE_JQ=false
 command -v jq >/dev/null 2>&1 && HAVE_JQ=true
@@ -145,4 +153,82 @@ command -v pkexec >/dev/null 2>&1 || \
 
 say "Note: whether passwordless sudo really works shows on the first"
 say "      switch -- omarchy-vpn-toggle then says so clearly."
-say "      For the setup see the README, section Installation, step 4."
+say "      Everything privileged at once: ./install --system"
+
+# ------------------------------------------------------------ --system
+#
+# The four privileged steps, which used to be copied out of the README by
+# hand. Two of the three mishaps when installing on a second machine came
+# from that copying: one of four commands never ran, and the sudoers line
+# existed in two spellings.
+#
+# Deliberately NOT part of the default run: without --system this script
+# executes nothing privileged and touches nothing outside $HOME, so it can
+# be used as a check at any time. Handing over a password stays something
+# one asks for.
+[ "$SYSTEM" = true ] || exit 0
+
+# Running under sudo, $USER would be root and the rule would name root --
+# it would grant nothing to the person who is supposed to switch. FAKE_EUID
+# exists for the test suite, which cannot become root.
+if [ "${FAKE_EUID:-$(id -u)}" = "0" ]; then
+  say "install --system must be run as your own user, not as root --"
+  say "otherwise the sudoers line names root instead of you."
+  exit 1
+fi
+
+# Puts SRC at DST, if it is not already byte-identical there. Returns 0 if
+# something was done, 1 if it was already current -- the caller does not
+# evaluate that, it only reports.
+put() {
+  local src="$1" dst="$2" mode="$3" what="$4"
+  if cmp -s "$src" "$dst" 2>/dev/null; then
+    say "already current: $dst"
+    return 1
+  fi
+  say "installing $what -> $dst"
+  sudo install -m "$mode" -o root -g root "$src" "$dst" || {
+    say "FAILED: could not install $dst"
+    exit 1
+  }
+}
+
+# The order is a contract. The program goes in FIRST, the rule that points
+# at it second. The other way round leaves, if the copy fails, a rule
+# pointing at nothing -- and sudo does not treat a rule whose program it
+# cannot resolve as matching, so the missing program then looks like a
+# missing permission. That cost an hour on the laptop.
+put "$DIR/share/omarchy-vpn-privileged" "$PRIV" 755 "the switching program"
+
+# id -un, not $USER: the variable can be stale or unset (a lean environment,
+# a service context), and a sudoers line naming the wrong user grants the
+# permission to somebody else and none to the person switching. $USER only
+# as a fallback.
+me="$(id -un 2>/dev/null || printf '%s' "${USER:-}")"
+[ -n "$me" ] || { say "FAILED: could not determine the user name"; exit 1; }
+line="$me ALL=(root) NOPASSWD: $PRIV"
+if [ -f "$SUDOERS" ] && grep -Fxq "$line" "$SUDOERS" 2>/dev/null; then
+  say "already current: $SUDOERS"
+else
+  # The detour through a scratch file is the point, not a formality: written
+  # straight into the target and checked afterwards, a faulty line would
+  # cripple EVERY sudo on the machine for the window in between -- including
+  # the one needed to repair it.
+  tmp="$(mktemp -t smartalb-vpn.XXXXXX)" || { say "FAILED: no scratch file"; exit 1; }
+  printf '%s\n' "$line" >"$tmp"
+  if ! sudo visudo -c -f "$tmp" >/dev/null; then
+    rm -f "$tmp"
+    say "FAILED: the generated sudoers line was rejected -- nothing was changed."
+    exit 1
+  fi
+  say "installing the sudoers rule -> $SUDOERS"
+  sudo install -m 440 -o root -g root "$tmp" "$SUDOERS" || {
+    rm -f "$tmp"; say "FAILED: could not install $SUDOERS"; exit 1
+  }
+  rm -f "$tmp"
+fi
+
+put "$DIR/share/omarchy-vpn-import" "$IMPORT" 755 "the import program"
+put "$DIR/share/omarchy-vpn-import.policy" "$POLICY" 644 "the polkit action"
+
+say "System part done. If the widget is running: omarchy-restart-shell"

@@ -51,7 +51,7 @@ setup_sandbox() {
   mkdir -p "$SANDBOX/sysbin"
   local tool
   local toolpath
-  for tool in bash jq sed grep tail head cut cat mktemp mv rm mkdir basename dirname readlink env printf sort ln timeout sleep cmp stat sha256sum wc tr find mkfifo; do
+  for tool in bash jq sed grep tail head cut cat mktemp mv rm mkdir basename dirname readlink env printf sort ln timeout sleep cmp stat sha256sum wc tr find mkfifo install id; do
     toolpath="$(command -v "$tool" 2>/dev/null)"
     if [ -n "$toolpath" ]; then
       ln -sf "$toolpath" "$SANDBOX/sysbin/$tool"
@@ -103,7 +103,36 @@ if [ -e "$SANDBOX/sudo-denies" ]; then
   echo "sudo: a password is required" >&2
   exit 1
 fi
+# The stub runs the command, it does not confer privilege. 'install -o root
+# -g root' would therefore fail on the ownership change, and the caller
+# would see a failure that only exists because we are not root. The two
+# options are dropped for that reason -- mode and content, which the tests
+# do check, stay untouched.
+if [ "\${1:-}" = "install" ]; then
+  args=(); shift
+  while [ \$# -gt 0 ]; do
+    case "\$1" in
+      -o|-g) shift 2 ;;
+      *) args+=("\$1"); shift ;;
+    esac
+  done
+  exec install "\${args[@]}"
+fi
 exec "\$@"
+STUB
+
+  # Stands in for the sudoers syntax check. The real visudo would have to
+  # be given a file it accepts; here the verdict is switchable, because what
+  # matters is what 'install --system' does with a REJECTION -- it must not
+  # put the file into place.
+  cat >"$SANDBOX/stub/visudo" <<STUB
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >>"$SANDBOX/visudo.log"
+if [ -e "$SANDBOX/visudo-rejects" ]; then
+  echo "\${3:-}: syntax error near line 1 <<<" >&2
+  exit 1
+fi
+echo "\${3:-}: parsed OK"
 STUB
 
   cat >"$SANDBOX/stub/pkexec" <<STUB
@@ -218,6 +247,8 @@ STUB
   export OMARCHY_VPN_PRIVILEGED="$SANDBOX/priv/omarchy-vpn-privileged"
   export OMARCHY_VPN_IMPORT="$SANDBOX/priv/omarchy-vpn-import"
   export OMARCHY_VPN_POLICY="$SANDBOX/polkit-actions/org.omarchy.smartalbvpn.import.policy"
+  mkdir -p "$SANDBOX/sudoers.d"
+  export OMARCHY_VPN_SUDOERS="$SANDBOX/sudoers.d/smartalb-vpn"
 
   write_connections <<'JSON'
 [
@@ -3406,6 +3437,109 @@ test_inspect_and_import_agree_beyond_the_flat_openvpn_case() {
 # anything), and it reads/writes nothing but the configuration file
 # redirected through OMARCHY_VPN_CONNECTIONS inside the sandbox HOME.
 # No systemctl, no omarchy-vpn-toggle.
+
+# ------------------------------------------------ install --system tests
+#
+# './install --system' performs the four privileged steps that used to be
+# copied by hand out of the README. Two of the three mishaps during the test
+# installation on a second machine came from exactly that copying: one of
+# four commands never ran, and the sudoers line existed in two spellings.
+#
+# In the sandbox nothing privileged happens: 'sudo' and 'visudo' are stubs,
+# and all four target paths are redirected through the environment.
+
+# The order is a contract, not a preference. If the sudoers file goes in
+# first and installing the program then fails, a rule stands that points at
+# nothing -- and that is exactly the state which cost an hour on the laptop,
+# because sudo does not treat a rule whose program it cannot resolve as
+# matching, so a missing program looks like a missing permission.
+test_install_system_installs_program_before_sudoers_rule() {
+  "$PLUGIN_DIR/install" --system >/dev/null 2>&1
+  local log priv_line sudoers_line
+  log="$SANDBOX/sudo.log"
+  [ -f "$log" ] || fail "install --system called no sudo at all"
+  priv_line="$(grep -n "omarchy-vpn-privileged" "$log" | head -n1 | cut -d: -f1)"
+  sudoers_line="$(grep -n "$OMARCHY_VPN_SUDOERS" "$log" | head -n1 | cut -d: -f1)"
+  [ -n "$priv_line" ]    || fail "the switching program was never installed" "$(cat "$log")"
+  [ -n "$sudoers_line" ] || fail "the sudoers file was never installed" "$(cat "$log")"
+  [ "$priv_line" -lt "$sudoers_line" ] ||     fail "the sudoers rule was put in place before the program it points at" "$(cat "$log")"
+}
+
+# A rejected sudoers file must not reach its destination -- that is the whole
+# reason for the detour through a temporary file.
+test_install_system_keeps_rejected_sudoers_out() {
+  local rc=0
+  : >"$SANDBOX/visudo-rejects"
+  "$PLUGIN_DIR/install" --system >/dev/null 2>&1 || rc=$?
+  [ "$rc" -ne 0 ] || fail "a rejected sudoers file was reported as success"
+  [ ! -f "$OMARCHY_VPN_SUDOERS" ] ||     fail "the rejected file was put into place anyway" "$(cat "$OMARCHY_VPN_SUDOERS")"
+}
+
+# ... and it must not leave its scratch file behind either.
+#
+# The scratch path is not guessed here -- it is read back out of the sudo
+# log. Searching /tmp for a name of my own invention would keep this test
+# green for ever if the implementation chose a different one; this way the
+# test fails when no scratch file is written at all.
+test_install_system_leaves_no_scratch_file_after_rejection() {
+  : >"$SANDBOX/visudo-rejects"
+  "$PLUGIN_DIR/install" --system >/dev/null 2>&1
+  local scratch
+  scratch="$(grep -o "/[^ ]*smartalb-vpn[^ ]*" "$SANDBOX/visudo.log" 2>/dev/null | head -n1)"
+  [ -n "$scratch" ] || \
+    fail "visudo was never handed a scratch file -- the check was skipped" \
+         "$(cat "$SANDBOX/visudo.log" 2>/dev/null)"
+  [ ! -e "$scratch" ] || fail "the scratch file was left behind" "$scratch"
+}
+
+# Repeatable: a second run over an unchanged system installs nothing again.
+# This is what makes the command usable as the routine after a plugin update.
+test_install_system_is_idempotent() {
+  "$PLUGIN_DIR/install" --system >/dev/null 2>&1
+  : >"$SANDBOX/sudo.log"
+  local out
+  out="$("$PLUGIN_DIR/install" --system 2>&1)"
+  if grep -q "omarchy-vpn-privileged" "$SANDBOX/sudo.log"; then
+    fail "an unchanged program was installed a second time" "$(cat "$SANDBOX/sudo.log")"
+  fi
+  assert_contains "$out" "already current"
+}
+
+# The mirror image: an outdated copy IS replaced. Without this the command
+# would be useless for exactly the case it exists for.
+test_install_system_replaces_an_outdated_copy() {
+  "$PLUGIN_DIR/install" --system >/dev/null 2>&1
+  printf 'stale\n' >"$OMARCHY_VPN_PRIVILEGED"
+  : >"$SANDBOX/sudo.log"
+  "$PLUGIN_DIR/install" --system >/dev/null 2>&1
+  grep -q "omarchy-vpn-privileged" "$SANDBOX/sudo.log" ||     fail "an outdated copy was not replaced" "$(cat "$SANDBOX/sudo.log")"
+  cmp -s "$PLUGIN_DIR/share/omarchy-vpn-privileged" "$OMARCHY_VPN_PRIVILEGED" ||     fail "after replacing, the copy still differs from the source"
+}
+
+# Without --system nothing privileged happens. './install' has to stay the
+# harmless check that the README says it is.
+test_install_without_system_calls_no_sudo() {
+  "$PLUGIN_DIR/install" >/dev/null 2>&1
+  [ ! -f "$SANDBOX/sudo.log" ] || fail "plain install called sudo" "$(cat "$SANDBOX/sudo.log")"
+  [ ! -f "$SANDBOX/visudo.log" ] || fail "plain install called visudo"
+}
+
+# Run as root the line would name root instead of the real user -- a rule
+# that grants nothing to the person who is supposed to switch.
+test_install_system_refuses_to_run_as_root() {
+  local rc=0 out
+  out="$(FAKE_EUID=0 "$PLUGIN_DIR/install" --system 2>&1)" || rc=$?
+  [ "$rc" -ne 0 ] || fail "install --system accepted being run as root"
+  assert_contains "$out" "not as root"
+  [ ! -f "$SANDBOX/sudo.log" ] || fail "something was installed despite the refusal"
+}
+
+test_install_rejects_unknown_argument() {
+  local rc=0 out
+  out="$("$PLUGIN_DIR/install" --wat 2>&1)" || rc=$?
+  assert_eq "$rc" "64"
+  assert_contains "$out" "Usage"
+}
 
 test_install_reports_valid_config_unchanged() {
   local out
