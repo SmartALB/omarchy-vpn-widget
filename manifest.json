@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "smartalb.vpn",
   "name": "VPN",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "author": "SmartALB",
   "license": "MIT",
   "description": "Switch, create and remove OpenVPN and WireGuard connections from the bar",

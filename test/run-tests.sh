@@ -3438,6 +3438,30 @@ test_inspect_and_import_agree_beyond_the_flat_openvpn_case() {
 # redirected through OMARCHY_VPN_CONNECTIONS inside the sandbox HOME.
 # No systemctl, no omarchy-vpn-toggle.
 
+# The version in the footer is a SECOND copy of what manifest.json says --
+# QML cannot reach the manifest (Omarchy's PluginRegistry is an instance,
+# not a singleton), and reading the file at runtime would run entirely
+# untested, since the suite barely touches Panel.qml.
+#
+# A duplicate is acceptable exactly as long as it cannot drift in silence.
+# That is what this test is for: the copies under /usr/local/bin could rot
+# for days because nothing compared them; this one turns red on the next
+# run.
+test_panel_version_matches_the_manifest() {
+  local in_qml in_manifest
+  in_qml="$(sed -n 's/.*readonly property string pluginVersion: "\([^"]*\)".*/\1/p' \
+            "$PLUGIN_DIR/Panel.qml" | head -n1)"
+  [ -n "$in_qml" ] || fail "Panel.qml declares no pluginVersion"
+  in_manifest="$(jq -r '.version' "$PLUGIN_DIR/manifest.json")"
+  assert_eq "$in_qml" "$in_manifest"
+}
+
+# ... and it has to be rendered, not merely declared.
+test_panel_shows_the_version_in_the_footer() {
+  grep -q 'text: "v" + root.pluginVersion' "$PLUGIN_DIR/Panel.qml" || \
+    fail "the version is declared but nowhere displayed"
+}
+
 # ---------------------------------------------- uninstall --system tests
 #
 # The counterpart to 'install --system'. Those four sudo rm commands were

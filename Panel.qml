@@ -14,6 +14,11 @@ Panel {
   ipcTarget: "smartalb.vpn"
   manageIpc: true
 
+  // A second copy of what manifest.json says -- QML cannot reach the
+  // manifest (Omarchy's PluginRegistry is an instance, not a singleton).
+  // test_panel_version_matches_the_manifest keeps the two from drifting.
+  readonly property string pluginVersion: "1.2.0"
+
   property var connections: []
   property string loadError: ""
   property string toggleError: ""
@@ -1182,6 +1187,23 @@ Panel {
       }
       }
     }
+
+      // Footer. Deliberately the last thing in the column and dimmed: it
+      // is meant to be findable when someone reports a problem, not to
+      // compete with the connection list.
+      PanelSeparator {
+        foreground: root.fg
+      }
+
+      Text {
+        width: panelColumn.width
+        horizontalAlignment: Text.AlignRight
+        text: "v" + root.pluginVersion
+        color: root.fg
+        opacity: 0.55
+        font.family: root.fontFam
+        font.pixelSize: Style.font.caption
+      }
     }
   }
 }
