@@ -530,7 +530,7 @@ For OpenVPN an **allowlist** applies: what is permitted is enumerated, not
 what would be forbidden. A configuration is rejected as soon as it contains
 a directive that is not on it -- with the line number and the directive.
 
-The list holds 112 directives: everything a **self-contained client
+The list holds 111 directives: everything a **self-contained client
 configuration** needs -- remote, protocol, device, encryption and
 negotiation, certificate checking, timing and retry behavior, verbosity,
 routing, dropping privileges (`user`, `group`). What is **not** on the list
@@ -824,7 +824,7 @@ set**: all 297 directives of the OpenVPN 2.7.6 manual page stand in two
 tables -- the 111 of them that are listed have to be accepted, the
 remaining 186 rejected. One listed directive, `ncp-ciphers`, is no longer a
 manual heading in 2.7.6 and therefore appears in neither table; it stands
-additionally in the table of listed directives, which thereby counts 112
+additionally in the table of listed directives, which thereby counts 111
 entries instead of 111. Put a directive on the list or take one off it, and
 exactly one test turns red and names it. On top of that there is a table of
 every directive that four reviews of this project found to be an attack

@@ -60,7 +60,7 @@ Panel {
     return root.runner("{ " + cmd + " ; } 2> >(head -c " + root.maxOutBytes + " >&2)")
   }
 
-  readonly property string pluginVersion: "1.3.1"
+  readonly property string pluginVersion: "1.4.0"
 
   property var connections: []
   property string loadError: ""

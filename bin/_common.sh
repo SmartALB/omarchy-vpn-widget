@@ -52,7 +52,22 @@ need_jq() {
 # following ones would vanish silently (exit 0, no error message). A single
 # broken element invalidates the WHOLE file instead of quietly truncating
 # the list (review I3).
+# The state file is read before anything is capped, so its SIZE has to be
+# bounded before jq ever parses it -- otherwise a padded or corrupted file
+# exhausts the shell long before the 200-entry cap in 'list' applies
+# (second review round). 200 entries are a few tens of kilobytes.
+MAX_STATE_BYTES="${OMARCHY_VPN_MAX_STATE_BYTES:-262144}"
+
+state_file_too_big() {
+  local size
+  size="$(stat -c %s "$CONNECTIONS_FILE" 2>/dev/null)" || return 1
+  [ -n "$size" ] && [ "$size" -gt "$MAX_STATE_BYTES" ]
+}
+
 read_connections() {
+  if state_file_too_big; then
+    return 1
+  fi
   if [ -r "$CONNECTIONS_FILE" ] && \
      jq -e 'type == "array" and all(.[]; type == "object")' "$CONNECTIONS_FILE" >/dev/null 2>&1; then
     jq -c . "$CONNECTIONS_FILE"

@@ -94,7 +94,20 @@ fi
 # Read as the USER, not as root -- see the header comment. '--' and 'cat'
 # instead of a redirection, so that a path with a leading '-' is not read as
 # an option.
-content="$(cat -- "$path" 2>/dev/null)"
+# The bound belongs at the FIRST boundary, not at the second. inspect and
+# the privileged importer each carry their own -- but they only ever see
+# what this program has already read whole into a variable, so an unbounded
+# read here made theirs arrive too late (second review round).
+# MAX+1 bytes: if the extra one turned up, there was more than we accept.
+MAX_BYTES=1048576
+# Still exactly one read of the file -- 'head' only bounds what reaches the
+# variable, and closes the pipe once it has enough (test_add_reads_the_file_only_once
+# proves the single read by poisoning a second one).
+content="$(cat -- "$path" 2>/dev/null | head -c $((MAX_BYTES + 1)))"
+if [ "${#content}" -gt "$MAX_BYTES" ]; then
+  echo "$ME: file too large: $path -- more than $MAX_BYTES bytes" >&2
+  exit 10
+fi
 if [ -z "${content//[[:space:]]/}" ]; then
   echo "$ME: file is empty: $path" >&2
   exit 10

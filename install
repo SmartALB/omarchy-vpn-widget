@@ -205,10 +205,33 @@ done
 
 # The rule binds '#<uid>', not a login name. A name is text that sudoers
 # interprets -- an account called 'ALL' would change what the rule means.
-tar -C "$DIR/share" -cf - \
+# The payload is read ONCE, into a copy, and bound to a digest taken from
+# exactly those bytes. Archiving straight out of the checkout meant tar
+# opened each file a second time, after the decision to install had been
+# made -- a same-uid swap in that moment would have published bytes nobody
+# looked at (second review round).
+#
+# This narrows it to a single read and lets root refuse anything that does
+# not match what was hashed here. It does NOT make an adversary already
+# running as this user harmless: the copy and its digest are made by that
+# same user. Only a binding to something outside the checkout -- a signed
+# release -- closes that, which is a question for the marketplace rather
+# than for this script. The digests are printed so they can be compared
+# against a published release.
+payload="$(mktemp -d)" || { say "FAILED: no staging directory"; exit 1; }
+trap 'rm -rf "$payload"' EXIT
+for f in omarchy-vpn-privileged omarchy-vpn-import omarchy-vpn-import.policy; do
+  cat -- "$DIR/share/$f" >"$payload/$f" || { say "FAILED: could not read share/$f"; exit 1; }
+done
+digests="$(cd "$payload" && sha256sum omarchy-vpn-privileged omarchy-vpn-import omarchy-vpn-import.policy)" \
+  || { say "FAILED: could not fingerprint the payload"; exit 1; }
+say "Payload fingerprints:"
+printf '  %s\n' "$digests"
+
+tar -C "$payload" -cf - \
       omarchy-vpn-privileged omarchy-vpn-import omarchy-vpn-import.policy 2>/dev/null \
   | sudo env VPN_UID="$uid" VPN_PRIV="$PRIV" VPN_IMPORT="$IMPORT" \
-         VPN_POLICY="$POLICY" VPN_SUDOERS="$SUDOERS" bash -c '
+         VPN_POLICY="$POLICY" VPN_SUDOERS="$SUDOERS" VPN_DIGESTS="$digests" bash -c '
 set -uo pipefail
 umask 077
 
@@ -226,6 +249,15 @@ tar -C "$stage" -xf - || { echo "root: could not unpack the payload" >&2; exit 1
 for f in omarchy-vpn-privileged omarchy-vpn-import omarchy-vpn-import.policy; do
   [ -f "$stage/$f" ] && [ ! -L "$stage/$f" ] || { echo "root: payload incomplete: $f" >&2; exit 1; }
 done
+
+# The bytes that arrived have to be the bytes that were fingerprinted. This
+# is checked INSIDE the privileged process, before anything is published.
+printf "%s\n" "$VPN_DIGESTS" >"$stage/digests"
+( cd "$stage" && sha256sum -c --status digests ) || {
+  echo "root: the payload does not match its fingerprints -- nothing was changed" >&2
+  exit 1
+}
+rm -f "$stage/digests"
 
 printf "#%s ALL=(root) NOPASSWD: %s\n" "$VPN_UID" "$VPN_PRIV" >"$stage/sudoers"
 if ! visudo -c -f "$stage/sudoers" >/dev/null; then

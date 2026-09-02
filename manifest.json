@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "smartalb.vpn",
   "name": "VPN Units",
-  "version": "1.3.1",
+  "version": "1.4.0",
   "author": "SmartALB",
   "license": "MIT",
   "description": "OpenVPN and WireGuard as systemd units -- so a mount or service that depends on a tunnel keeps working. Imports .ovpn and .conf files through a checked allowlist; certificate and key auth only.",

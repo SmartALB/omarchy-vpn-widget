@@ -1323,7 +1323,7 @@ route-table 200
 route-gateway 10.8.0.1
 route-ipv6 2001:db8::/32
 route-noexec
-setenv UV_PLAT linux
+setenv-safe UV_PLAT linux
 setenv-safe CUSTOMER example
 auth-retry nointeract
 verb 4
@@ -1645,7 +1645,7 @@ test_inspect_accepts_every_directive_of_the_minimum_set() {
            "data-ciphers AES-256-GCM:AES-128-GCM" \
            "data-ciphers-fallback AES-256-CBC" \
            "verify-x509-name gw.example.example name" \
-           "pull-filter ignore redirect-gateway" "setenv UV_PLAT linux" \
+           "pull-filter ignore redirect-gateway" "setenv-safe UV_PLAT linux" \
            "compress" "comp-lzo no" "x509-username-field CN" \
            "key-direction 1" "redirect-gateway def1" \
            "dhcp-option DNS 10.20.0.53" "reneg-sec 0" "ping 15" \
@@ -1712,11 +1712,24 @@ test_inspect_rejects_setenv_opt_prefix() {
     [ "$(printf '%s' "$out" | jq -r '.ok')" = "false" ] || \
       fail "setenv prefixing slipped through: $d"
   done
-  # Counter-check: the form commercial providers ship, and the ordinary
-  # variable assignment, both have to pass. Without them the simplest
-  # "solution" to the finding above would be to strike 'setenv' entirely.
-  for d in "setenv opt block-outside-dns" "setenv FORWARD_COMPATIBLE 1" \
-           "setenv UV_PLAT linux" "setenv-safe CUSTOMER example"; do
+  # This block used to guard the opposite: it insisted that a plain
+  # 'setenv NAME value' keep working, on the reasoning that striking
+  # 'setenv' entirely would be the lazy answer to the prefix finding. The
+  # second review round showed the reasoning was wrong. A bare 'setenv' sets
+  # ANY variable for a root openvpn process -- LD_PRELOAD included -- so
+  # striking it was not the lazy answer but the correct one, and the
+  # counter-check was protecting the hole.
+  for d in "setenv FORWARD_COMPATIBLE 1" "setenv UV_PLAT linux" \
+           "setenv LD_PRELOAD /tmp/x"; do
+    out="$( { ovpn_ok; printf '%s\n' "$d"; } | inspect )"
+    [ "$(printf '%s' "$out" | jq -r '.ok')" = "false" ] || \
+      fail "a bare setenv assignment was accepted: $d"
+  done
+  # What must keep working: the prefix form commercial providers ship -- it
+  # passes on the strength of the directive behind it, not of 'setenv' --
+  # and setenv-safe, which openvpn prefixes with OPENVPN_ so it cannot name
+  # a loader variable.
+  for d in "setenv opt block-outside-dns" "setenv-safe CUSTOMER example"; do
     out="$( { ovpn_ok; printf '%s\n' "$d"; } | inspect )"
     [ "$(printf '%s' "$out" | jq -r '.ok')" = "true" ] || \
       fail "valid setenv line rejected: $d" \
@@ -2016,7 +2029,7 @@ test_inspect_accepts_exactly_the_directives_on_the_allowlist() {
           reneg-bytes reneg-pkts reneg-sec replay-window resolv-retry \
           route route-delay route-gateway route-ipv6 \
           route-ipv6-gateway route-metric route-noexec route-nopull \
-          route-table rport server-poll-timeout setenv setenv-safe \
+          route-table rport server-poll-timeout setenv-safe \
           shaper sndbuf tcp-nodelay tls-cert-profile tls-cipher \
           tls-ciphersuites tls-client tls-groups tls-timeout \
           tls-version-max tls-version-min topology tran-window tun-mtu \
@@ -2026,7 +2039,9 @@ test_inspect_accepts_exactly_the_directives_on_the_allowlist() {
       fail "listed directive rejected: $d"
     n=$((n + 1))
   done
-  assert_eq "$n" "112"
+  # 111 since the second review round: bare 'setenv' was struck. See
+  # test_setenv_cannot_set_loader_variables for why.
+  assert_eq "$n" "111"
 }
 
 # -------------------------------------------------- omarchy-vpn-import
@@ -3343,7 +3358,7 @@ test_inspect_and_import_agree() {
            "engine dynamic" "providers legacy" "register-dns" "win-sys env" \
            "setenv opt up /tmp/x" "setenv opt script-security 2" \
            "setenv opt ca /etc/shadow" "setenv OPT up /tmp/x" "setenv opt" \
-           "setenv opt block-outside-dns" "setenv FORWARD_COMPATIBLE 1" \
+           "setenv opt block-outside-dns" \
            "setenv-safe CUSTOMER example" \
            "daemon" "user nobody" "group nobody" "syslog vpn" "nice 5" \
            "echo hello" "mlock" "mode server" "server 10.8.0.0 255.255.255.0" \
@@ -3446,6 +3461,127 @@ test_inspect_and_import_agree_beyond_the_flat_openvpn_case() {
 # anything), and it reads/writes nothing but the configuration file
 # redirected through OMARCHY_VPN_CONNECTIONS inside the sandbox HOME.
 # No systemctl, no omarchy-vpn-toggle.
+
+# --- Second review round: four regression tests it asked for ------------
+
+# 'setenv' set any environment variable for the root openvpn process --
+# LD_PRELOAD among them, which loads attacker code into the executables
+# openvpn itself invokes. Rejecting 'up' and 'plugin' while allowing this
+# was a door beside the one we had locked. openvpn ships 'setenv-safe' for
+# exactly this reason: it prefixes every name with OPENVPN_.
+test_setenv_cannot_set_loader_variables() {
+  local v
+  for v in LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT PATH IFS BASH_ENV FORWARD_COMPATIBLE; do
+    local out
+    out="$(printf 'client\nremote 192.0.2.1 1194\nsetenv %s /tmp/x\n' "$v" | inspect)"
+    [ "$(printf '%s' "$out" | jq -r '.ok')" = "false" ] || \
+      fail "setenv $v was accepted" "$out"
+  done
+}
+
+# setenv-safe stays: it cannot name a loader variable, because openvpn
+# prefixes what it sets.
+test_setenv_safe_is_still_accepted() {
+  local out
+  out="$(printf 'client\nremote 192.0.2.1 1194\nsetenv-safe CUSTOMER example\n' | inspect)"
+  assert_eq "$(printf '%s' "$out" | jq -r '.ok')" "true"
+}
+
+# ... and so does the one form commercial configurations really ship. It
+# needs no exception: 'setenv opt' is a prefix openvpn strikes, so what is
+# judged is 'block-outside-dns', which is on the allowlist in its own right.
+test_setenv_opt_block_outside_dns_still_passes() {
+  local out
+  out="$(printf 'client\nremote 192.0.2.1 1194\nsetenv opt block-outside-dns\n' | inspect)"
+  assert_eq "$(printf '%s' "$out" | jq -r '.ok')" "true"
+}
+
+# omarchy-vpn-add read the whole chosen file into a shell variable before
+# either bounded program saw it. The bound belongs at the first boundary,
+# not the second.
+test_add_rejects_oversized_file() {
+  local rc=0 err big
+  big="$SANDBOX/huge.ovpn"
+  head -c 1200000 /dev/zero | tr '\0' 'a' >"$big"
+  err="$("$BIN/omarchy-vpn-add" "$big" "Huge" 2>&1)" || rc=$?
+  [ "$rc" -ne 0 ] || fail "an oversized file was accepted"
+  # "file too large" is omarchy-vpn-add's own wording. The importer says
+  # "input too large" and inspect the same -- asserting on that would have
+  # passed on the strength of a downstream bound while this program still
+  # read the file whole, which is exactly what the review objected to.
+  assert_contains "$err" "file too large"
+  [ ! -e "$SANDBOX/etc/openvpn/client/Huge.conf" ] || fail "it was written anyway"
+  # The message alone proves nothing: without a bound at the READ, cat still
+  # pulls the whole file into the variable and the length check then reports
+  # it just the same. A mutation probe showed exactly that. What the review
+  # asked for is a bound on the read itself, so the bytes are never held.
+  grep -q 'cat -- "$path" 2>/dev/null | head -c' "$BIN/omarchy-vpn-add" || \
+    fail "the read in omarchy-vpn-add is not bounded -- only its result is checked"
+}
+
+# The connection list was read and parsed in full -- twice -- before the
+# 200-entry cap applied. A corrupted or padded state file could exhaust the
+# shell before the cap was ever reached.
+test_list_refuses_an_oversized_state_file() {
+  local out size
+  # VALID JSON, deliberately: three megabytes of rubbish is refused for
+  # being unparseable, which says nothing about a size bound. A mutation
+  # probe showed exactly that -- the test passed with the bound removed.
+  # This file parses fine and is merely too big.
+  { printf '['
+    for ((i=1; i<=4000; i++)); do
+      [ "$i" -gt 1 ] && printf ','
+      printf '{"id":"c%s","label":"padding-padding-padding-padding-%s","unit":"openvpn-client@c%s"}' "$i" "$i" "$i"
+    done
+    printf ']'
+  } >"$OMARCHY_VPN_CONNECTIONS"
+  size="$(stat -c %s "$OMARCHY_VPN_CONNECTIONS")"
+  [ "$size" -gt 262144 ] || fail "the fixture is not over the bound at all ($size bytes)"
+  printf '%s' "$(cat "$OMARCHY_VPN_CONNECTIONS")" | jq -e 'type == "array"' >/dev/null 2>&1 || \
+    fail "the fixture is not valid JSON -- then this tests the wrong thing"
+
+  out="$("$BIN/omarchy-vpn-list" --json 2>&1)"
+  printf '%s' "$out" | jq -e 'type == "object" and has("error")' >/dev/null 2>&1 || \
+    fail "an oversized but valid state file was parsed anyway" "$(printf '%s' "$out" | head -c 160)"
+
+  # ... and an ordinary one still works, so the bound is a bound, not a wall.
+  write_connections <<<'[{"id":"a","label":"a","unit":"openvpn-client@a"}]'
+  out="$("$BIN/omarchy-vpn-list" --json 2>/dev/null)"
+  assert_eq "$(printf '%s' "$out" | jq 'length')" "1"
+}
+
+# ... and the bytes that reach root have to be the bytes that were
+# fingerprinted. The stub below makes the user side record a digest that
+# does not describe what it sends, while root's own '-c' check runs for
+# real -- which is exactly the shape of a payload swapped after the
+# decision to install was taken.
+test_install_system_refuses_a_substituted_payload() {
+  seed_system_artefacts
+  printf 'the previous helper\n' >"$OMARCHY_VPN_PRIVILEGED"
+  cat >"$SANDBOX/stub/sha256sum" <<STUB
+#!/usr/bin/env bash
+# Verification ('-c') is the real thing; producing a digest is not.
+for a in "\$@"; do [ "\$a" = "-c" ] && exec "$SANDBOX/sysbin/sha256sum" "\$@"; done
+for f in "\$@"; do
+  printf '%s  %s\n' "0000000000000000000000000000000000000000000000000000000000000000" "\$f"
+done
+STUB
+  "$TEST_CHMOD" +x "$SANDBOX/stub/sha256sum"
+  "$PLUGIN_DIR/install" --system >/dev/null 2>&1
+  rm -f "$SANDBOX/stub/sha256sum"
+  assert_eq "$(cat "$OMARCHY_VPN_PRIVILEGED")" "the previous helper"
+}
+
+# The privileged payload must be read ONCE. Reading it again at archive time
+# reopens a mutable path after the decision to install was made.
+test_install_system_reads_the_payload_once() {
+  local body
+  body="$(sed 's|#.*$||' "$PLUGIN_DIR/install")"
+  case "$body" in
+    *'tar -C "$DIR/share"'*)
+      fail "the payload is archived straight from the checkout -- that is a second read" ;;
+  esac
+}
 
 # --- Panel: what the security review asked for (finding 4) --------------
 #

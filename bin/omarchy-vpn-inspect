@@ -224,6 +224,18 @@ normalize_word() {
 # Word for word identical in bin/omarchy-vpn-inspect and
 # share/omarchy-vpn-import; the parity test in test/run-tests.sh holds the
 # two together.
+# 'setenv' is deliberately ABSENT while 'setenv-safe' is present. Bare
+# 'setenv' sets any environment variable for the openvpn process, which runs
+# as root -- LD_PRELOAD among them, and with it attacker code inside every
+# executable openvpn itself invokes. Rejecting 'up' and 'plugin' while
+# allowing this was a door beside the one we had locked (second review
+# round). 'setenv-safe' cannot do it: openvpn prefixes every name it sets
+# with OPENVPN_.
+#
+# 'setenv opt <directive>' keeps working and needs no exception here: it is
+# a PREFIX openvpn strikes, so the branch above judges the directive that
+# follows. 'setenv opt block-outside-dns' therefore passes on the strength
+# of block-outside-dns, and 'setenv opt up /tmp/x' still fails on 'up'.
 allowed_openvpn() {
   case "$1" in
     allow-compression|auth|auth-nocache|auth-retry|bind|\
@@ -243,7 +255,7 @@ allowed_openvpn() {
     remote-random-hostname|reneg-bytes|reneg-pkts|reneg-sec|\
     replay-window|resolv-retry|route|route-delay|route-gateway|\
     route-ipv6|route-ipv6-gateway|route-metric|route-noexec|\
-    route-nopull|route-table|rport|server-poll-timeout|setenv|\
+    route-nopull|route-table|rport|server-poll-timeout|\
     setenv-safe|shaper|sndbuf|tcp-nodelay|tls-cert-profile|\
     tls-cipher|tls-ciphersuites|tls-client|tls-groups|tls-timeout|\
     tls-version-max|tls-version-min|topology|tran-window|tun-mtu|\
