@@ -9,7 +9,12 @@ SILENT=false
 say() { [ "$SILENT" = true ] || printf '%s\n' "$*"; }
 
 DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
-chmod +x "$DIR"/bin/* "$DIR"/share/* "$DIR/install" "$DIR/uninstall" "$DIR/test/run-tests.sh" 2>/dev/null
+# Named one by one, not "share/*": omarchy-vpn-import.policy is XML that
+# polkit reads, and an executable bit on it is wrong. A blanket glob would
+# also catch whatever data file lands in share/ later.
+chmod +x "$DIR"/bin/* \
+         "$DIR/share/omarchy-vpn-privileged" "$DIR/share/omarchy-vpn-import" \
+         "$DIR/install" "$DIR/uninstall" "$DIR/test/run-tests.sh" 2>/dev/null
 
 CONF="${OMARCHY_VPN_CONNECTIONS:-$HOME/.config/omarchy/vpn-connections.json}"
 PRIV="${OMARCHY_VPN_PRIVILEGED:-/usr/local/bin/omarchy-vpn-privileged}"

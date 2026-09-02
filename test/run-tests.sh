@@ -205,6 +205,12 @@ STUB
   # switched over.
   TEST_CHMOD="$(command -v chmod)"
 
+  # 'cp' is not in the symlink farm either -- not deliberately kept out like
+  # chmod, simply because no program under test needs it. Adding it would
+  # weaken what the farm proves. One test copies the whole plugin, so it
+  # gets the real path the same way.
+  TEST_CP="$(command -v cp)"
+
   chmod +x "$SANDBOX"/stub/*
   export PATH="$SANDBOX/stub:$SANDBOX/sysbin"
   export OMARCHY_VPN_CONNECTIONS="$HOME/.config/omarchy/vpn-connections.json"
@@ -3514,6 +3520,36 @@ test_install_confirms_polkit_action_present() {
   case "$out" in
     *"WARNING: polkit action missing"*) fail "an action that is present should not have been complained about" ;;
   esac
+}
+
+# install makes the plugin's own programs executable. It used to do that
+# with a blanket 'chmod +x share/*' -- which also caught
+# omarchy-vpn-import.policy, an XML file that polkit reads and nobody
+# executes. Harmless in effect, but every installation then carried a
+# permanent modification against its own git checkout, and that noise once
+# made a real "are there local changes worth keeping?" check ambiguous.
+#
+# This test needs a real chmod, which the exclusive PATH deliberately does
+# not have (see the comment at the install tests). It therefore runs a COPY
+# of the plugin with TEST_CHMOD reachable, so the repository itself is never
+# touched.
+test_install_makes_only_programs_executable() {
+  local copy chmoddir
+  copy="$SANDBOX/plugin-copy"
+  "$TEST_CP" -a "$PLUGIN_DIR" "$copy" || fail "could not copy the plugin"
+  "$TEST_CHMOD" 644 "$copy/share/omarchy-vpn-privileged" "$copy/share/omarchy-vpn-import" \
+                    "$copy/share/omarchy-vpn-import.policy" || fail "could not prepare permissions"
+
+  chmoddir="$SANDBOX/with-chmod"
+  mkdir -p "$chmoddir"
+  ln -sf "$TEST_CHMOD" "$chmoddir/chmod"
+  PATH="$chmoddir:$PATH" "$copy/install" >/dev/null 2>&1
+
+  [ -x "$copy/share/omarchy-vpn-privileged" ] || fail "the switching program did not become executable"
+  [ -x "$copy/share/omarchy-vpn-import" ]     || fail "the import program did not become executable"
+  if [ -x "$copy/share/omarchy-vpn-import.policy" ]; then
+    fail "the polkit action was made executable -- it is data, not a program"
+  fi
 }
 
 test_install_warns_when_polkit_action_missing() {

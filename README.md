@@ -226,6 +226,41 @@ fix is the package:
 sudo pacman -S --needed systemd-resolvconf
 ```
 
+There is a second way this goes wrong, with a different message:
+
+```
+resolvconf: signature mismatch: /etc/resolv.conf
+resolvconf: run `resolvconf -u` to update
+```
+
+Here `resolvconf` exists but refuses. Two packages provide the command:
+`systemd-resolvconf`, which is a thin shim in front of `systemd-resolved`,
+and `openresolv`, which manages `/etc/resolv.conf` itself. If `openresolv`
+is installed while `/etc/resolv.conf` points at
+`/run/systemd/resolve/stub-resolv.conf` -- that is, `systemd-resolved` is
+actually in charge -- then `openresolv` finds a file it did not write and
+declines to touch it. The interface comes up, the address and MTU are set,
+and only then does the DNS step fail; `wg-quick` tears the whole thing down
+again, so the unit ends in `failed` with no tunnel.
+
+Do **not** follow the suggestion and run `resolvconf -u`: that has
+`openresolv` take the file over and work against the resolver that is
+actually managing it. Install the matching bridge instead --
+`systemd-resolvconf` conflicts with `openresolv`, so pacman will offer the
+swap:
+
+```bash
+sudo pacman -S systemd-resolvconf
+```
+
+Which of the two is installed is worth checking before blaming the
+configuration:
+
+```bash
+pacman -Qo "$(command -v resolvconf)"
+ls -l /etc/resolv.conf
+```
+
 A configuration that sets its resolver through `PostUp = resolvectl ...`
 instead of `DNS =` avoids the dependency -- but such a hook is rejected by
 the import on purpose, because `wg-quick` passes those four `PostUp`,
@@ -546,6 +581,36 @@ An unknown connection exists only for `omarchy-vpn-toggle <id>`, not for
 connections. `toggle` reports an unknown `id` as plain text on stderr
 (exit 2), not as JSON -- the panel already collects stderr separately for
 exactly this case.
+
+### When nothing switches at all
+
+The panel shows the connections, but a click brings no tunnel up and the
+message mentions `sudo` or a password. Two different causes look the same
+from the outside, and both are about the setup, not the connection:
+
+- **The helper program is not installed.** `/usr/local/bin/omarchy-vpn-privileged`
+  is missing -- the `sudo install` from step 4 was skipped, or an update
+  refreshed only `share/` (see "Updating").
+- **The sudoers line is missing or does not match**, for instance because
+  it names a different path or a different user.
+
+They are hard to tell apart from the message, because a rule whose program
+`sudo` cannot resolve does not count as matching either -- so a missing
+program can present itself as a missing permission. What separates them
+reliably:
+
+```bash
+cd ~/.config/omarchy/plugins/smartalb.vpn
+./install          # says so when a helper program is missing
+sudo -l | grep omarchy-vpn    # shows whether the rule exists
+```
+
+`./install` executes nothing privileged and changes nothing outside your
+own home directory, so it can be run at any time as a check.
+
+If both are in place and switching still fails, the cause is no longer the
+setup but the unit -- carry on with the next section and with
+`journalctl -u <unit>`.
 
 ### When the displayed state is wrong
 
