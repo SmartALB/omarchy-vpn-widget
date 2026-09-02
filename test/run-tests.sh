@@ -3447,6 +3447,99 @@ test_inspect_and_import_agree_beyond_the_flat_openvpn_case() {
 # redirected through OMARCHY_VPN_CONNECTIONS inside the sandbox HOME.
 # No systemctl, no omarchy-vpn-toggle.
 
+# --- Panel: what the security review asked for (finding 4) --------------
+#
+# "Panel collectors and process lifecycles are unbounded: list/inspect
+# stdout and toggle/manage stderr are fully buffered; commands use
+# PATH-resolved bash; no wall-clock/process-tree teardown exists; and list
+# runtime is connections x SYSTEMCTL_TIMEOUT, both user-controlled."
+#
+# Three of these are structural and are held here by reading Panel.qml. The
+# fourth -- the cardinality cap -- is behaviour and gets a real test below.
+
+# A PATH-resolved interpreter is an invitation: whoever can put a 'bash'
+# earlier in PATH decides what the panel runs.
+test_panel_uses_no_path_resolved_interpreter() {
+  local hits
+  # Comments are stripped first: a comment explaining why a PATH-resolved
+  # bash is wrong must not be what makes the test fail.
+  hits="$(sed 's|//.*$||' "$PLUGIN_DIR/Panel.qml" | grep -n '"bash"' || true)"
+  [ -z "$hits" ] || fail "the panel starts a PATH-resolved bash" "$hits"
+}
+
+# Every process the panel starts carries a wall-clock bound, so a command
+# that never returns cannot pin the panel for ever.
+test_panel_bounds_every_process_in_time() {
+  local assigns unbounded
+  # Every place that hands a command to a Process, whether as a property or
+  # by assignment. Each one has to go through a runner -- that is where the
+  # absolute interpreter and the wall-clock bound live.
+  assigns="$(sed 's|//.*$||' "$PLUGIN_DIR/Panel.qml" | grep -cE 'command: |command = ')"
+  [ "$assigns" -gt 0 ] || fail "no process commands found -- the test is looking at the wrong thing"
+  unbounded="$(sed 's|//.*$||' "$PLUGIN_DIR/Panel.qml" \
+               | grep -E 'command: |command = ' | grep -vc 'root.runner')"
+  [ "$unbounded" = "0" ] || \
+    fail "$unbounded of $assigns process commands bypass the runner" \
+         "$(sed 's|//.*$||' "$PLUGIN_DIR/Panel.qml" | grep -E 'command: |command = ' | grep -v 'root.runner')"
+}
+
+# A panel that goes away must not leave processes running. The wall-clock
+# bound would end them eventually, but that can be two minutes of work
+# nobody is waiting for.
+test_panel_stops_its_processes_on_destruction() {
+  local block procs stopped
+  block="$(sed -n '/Component.onDestruction/,/^  }/p' "$PLUGIN_DIR/Panel.qml")"
+  [ -n "$block" ] || fail "the panel has no Component.onDestruction"
+  procs="$(grep -c '^    id: [a-zA-Z]*Proc$' "$PLUGIN_DIR/Panel.qml")"
+  stopped="$(printf '%s\n' "$block" | grep -c 'running = false')"
+  [ "$procs" -gt 0 ] || fail "no processes found -- the test is looking at the wrong thing"
+  assert_eq "$stopped" "$procs"
+}
+
+# And a bound on what a producer may hand back: a collector reads into
+# memory, so the limit belongs on the producing side, not on the reader.
+test_panel_bounds_what_producers_may_return() {
+  local body
+  body="$(cat "$PLUGIN_DIR/Panel.qml")"
+  # The limit sits in the two runners that feed a collector, not at each
+  # call site -- a limit that has to be remembered at every call is one that
+  # gets forgotten at one of them. So: both helpers carry it ...
+  case "$body" in
+    *"function runnerOut"*) ;; *) fail "there is no runnerOut" ;;
+  esac
+  case "$body" in
+    *"function runnerErr"*) ;; *) fail "there is no runnerErr" ;;
+  esac
+  local outdef errdef
+  outdef="$(sed -n '/function runnerOut/,/^  }/p' "$PLUGIN_DIR/Panel.qml")"
+  errdef="$(sed -n '/function runnerErr/,/^  }/p' "$PLUGIN_DIR/Panel.qml")"
+  case "$outdef" in *"head -c"*) ;; *) fail "runnerOut does not bound its producer" "$outdef" ;; esac
+  case "$errdef" in *"head -c"*) ;; *) fail "runnerErr does not bound its producer" "$errdef" ;; esac
+  # ... and nothing collecting output uses the bare runner.
+  local bare
+  bare="$(sed 's|//.*$||' "$PLUGIN_DIR/Panel.qml" \
+          | grep -E 'command: |command = ' | grep -c 'root.runner(' || true)"
+  [ "$bare" = "0" ] || \
+    fail "$bare command(s) use the unbounded runner although their output is collected"
+}
+
+# The list asks systemctl once per connection, each with its own timeout, so
+# its runtime is connections x timeout -- and the connection list is written
+# by the user. Beyond a sane count the rest is refused rather than queried.
+test_list_caps_the_number_of_connections() {
+  local many out n
+  # A bash loop rather than seq: the exclusive PATH does not carry seq, and
+  # a test that fails because a tool is missing has proved nothing.
+  many="$(for ((i=1; i<=500; i++)); do
+            printf '{"id":"c%s","label":"c%s","unit":"openvpn-client@c%s"}\n' "$i" "$i" "$i"
+          done | jq -s '.')"
+  printf '%s\n' "$many" >"$OMARCHY_VPN_CONNECTIONS"
+  out="$("$BIN/omarchy-vpn-list" --json 2>/dev/null)"
+  n="$(printf '%s' "$out" | jq 'length')"
+  [ "$n" -le 200 ] || fail "the list returned $n entries -- no cap is in effect"
+  [ "$n" -gt 0 ] || fail "the cap swallowed everything"
+}
+
 # The version in the footer is a SECOND copy of what manifest.json says --
 # QML cannot reach the manifest (Omarchy's PluginRegistry is an instance,
 # not a singleton), and reading the file at runtime would run entirely

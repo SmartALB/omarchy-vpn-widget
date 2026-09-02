@@ -17,7 +17,50 @@ Panel {
   // A second copy of what manifest.json says -- QML cannot reach the
   // manifest (Omarchy's PluginRegistry is an instance, not a singleton).
   // test_panel_version_matches_the_manifest keeps the two from drifting.
-  readonly property string pluginVersion: "1.3.0"
+  // Every process the panel starts goes through here. The security review
+  // found the collectors and lifetimes unbounded: a PATH-resolved "bash",
+  // no wall-clock limit, and collectors that read whatever a producer cares
+  // to hand back. Putting the bounds in one place is the point -- a limit
+  // that has to be remembered at each call site is a limit that will be
+  // forgotten at one of them.
+  //
+  // Absolute paths: whoever can put a "bash" earlier in PATH would
+  // otherwise decide what the panel runs.
+  readonly property string binBash: "/usr/bin/bash"
+  readonly property string binTimeout: "/usr/bin/timeout"
+  // Generous for a systemctl call, short enough that a wedged command does
+  // not pin the panel: -k sends KILL if TERM was ignored.
+  readonly property int runSeconds: 120
+  // A configuration is kilobytes; a connection list of 200 entries is well
+  // under this. Anything beyond is not an answer, it is a flood.
+  readonly property int maxOutBytes: 262144
+
+  // A panel that goes away must not leave work running behind it. The
+  // wall-clock bound in runner() would end these eventually, but "eventually"
+  // is up to two minutes of a systemctl call nobody is waiting for any more.
+  Component.onDestruction: {
+    startDirProc.running = false
+    listProc.running = false
+    toggleProc.running = false
+    inspectProc.running = false
+    manageProc.running = false
+  }
+
+  function runner(cmd) {
+    return [root.binTimeout, "-k", "5", String(root.runSeconds), root.binBash, "-c", cmd]
+  }
+  // For a command whose STDOUT is collected: the limit belongs on the
+  // producing side, so the bytes are never held in the first place.
+  function runnerOut(cmd) {
+    return root.runner("{ " + cmd + " ; } | head -c " + root.maxOutBytes)
+  }
+  // ... and for one whose STDERR is collected. Process substitution keeps
+  // the exit status of the command itself, which a pipe would replace.
+  function runnerErr(cmd) {
+    return root.runner("{ " + cmd + " ; } 2> >(head -c " + root.maxOutBytes + " >&2)")
+  }
+
+  readonly property string pluginVersion: "1.3.1"
 
   property var connections: []
   property string loadError: ""
@@ -165,7 +208,7 @@ Panel {
   function toggleConnection(id) {
     if (toggleProc.running) return
     root.toggleError = ""
-    toggleProc.command = ["bash", "-c", root.scriptDir + "/omarchy-vpn-toggle " + shellEscape(id)]
+    toggleProc.command = root.runnerErr(root.scriptDir + "/omarchy-vpn-toggle " + shellEscape(id))
     toggleProc.running = true
     // The panel deliberately stays open: the state change takes seconds
     // and should be visible.
@@ -222,9 +265,9 @@ Panel {
     root.addBusy = true
     root.addError = ""
     root.addKind = ""
-    inspectProc.command = ["bash", "-c",
+    inspectProc.command = root.runnerOut(
       "cat -- " + root.shellEscape(path) + " 2>/dev/null | "
-      + root.scriptDir + "/omarchy-vpn-inspect"]
+      + root.scriptDir + "/omarchy-vpn-inspect")
     inspectProc.running = true
   }
 
@@ -239,10 +282,10 @@ Panel {
     // The PATH goes to omarchy-vpn-add -- that runs as the user and reads
     // the file itself. Only its content travels on to the privileged
     // program; see the header comment of bin/omarchy-vpn-add.
-    manageProc.command = ["bash", "-c",
+    manageProc.command = root.runnerErr(
       root.scriptDir + "/omarchy-vpn-add " + root.shellEscape(root.addPath)
       + " " + root.shellEscape(root.addLabel)
-      + (root.addGroup !== "" ? " " + root.shellEscape(root.addGroup) : "")]
+      + (root.addGroup !== "" ? " " + root.shellEscape(root.addGroup) : ""))
     manageProc.running = true
   }
 
@@ -251,10 +294,10 @@ Panel {
     root.addBusy = true
     root.removeError = ""
     root.manageAction = "forget"
-    manageProc.command = ["bash", "-c",
+    manageProc.command = root.runnerErr(
       root.scriptDir + "/omarchy-vpn-forget " + root.shellEscape(root.removeId)
       + " " + root.shellEscape(root.removeUnit)
-      + (root.removeAlsoFile ? " --also-file" : "")]
+      + (root.removeAlsoFile ? " --also-file" : ""))
     manageProc.running = true
   }
 
@@ -329,8 +372,8 @@ Panel {
   Process {
     id: startDirProc
     running: true
-    command: ["bash", "-c",
-      'if [ -d "$HOME/Downloads" ]; then printf %s "$HOME/Downloads"; else printf %s "$HOME"; fi']
+    command: root.runnerOut(
+      'if [ -d "$HOME/Downloads" ]; then printf %s "$HOME/Downloads"; else printf %s "$HOME"; fi')
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -342,7 +385,7 @@ Panel {
 
   Process {
     id: listProc
-    command: ["bash", "-c", root.scriptDir + "/omarchy-vpn-list --json"]
+    command: root.runnerOut(root.scriptDir + "/omarchy-vpn-list --json")
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {

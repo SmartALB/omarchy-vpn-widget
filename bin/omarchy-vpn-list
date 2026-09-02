@@ -61,10 +61,17 @@ fi
 # compactly as with '-c' -- which is why this single call yields two
 # things: line 1 is the normalized array as JSON, every following line is
 # the unit name of one entry, in the same order as in the array.
-norm_out="$(printf '%s' "$conns" | jq -r '
+# The runtime of this program is connections x SYSTEMCTL_TIMEOUT: one
+# systemctl call per entry, each with its own bound. The list is written by
+# the user, so without a cap on the count the total is unbounded -- the
+# security review named exactly that. Beyond the cap the rest is dropped
+# here, before any systemctl call is made for it.
+MAX_CONNECTIONS="${OMARCHY_VPN_MAX_CONNECTIONS:-200}"
+
+norm_out="$(printf '%s' "$conns" | jq -r --argjson max "$MAX_CONNECTIONS" '
   [.[] | select((.id // "") != "")
    | {id: (.id // ""), label: (.label // ""),
-      unit: (.unit // ""), group: (.group // "")}]
+      unit: (.unit // ""), group: (.group // "")}][:$max]
   as $norm
   | ($norm | tojson), ($norm[].unit)
 ')"
