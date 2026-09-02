@@ -17,7 +17,7 @@ Panel {
   // A second copy of what manifest.json says -- QML cannot reach the
   // manifest (Omarchy's PluginRegistry is an instance, not a singleton).
   // test_panel_version_matches_the_manifest keeps the two from drifting.
-  readonly property string pluginVersion: "1.2.0"
+  readonly property string pluginVersion: "1.2.1"
 
   property var connections: []
   property string loadError: ""
@@ -1186,7 +1186,6 @@ Panel {
         }
       }
       }
-    }
 
       // Footer. Deliberately the last thing in the column and dimmed: it
       // is meant to be findable when someone reports a problem, not to
@@ -1204,6 +1203,7 @@ Panel {
         font.family: root.fontFam
         font.pixelSize: Style.font.caption
       }
+    }
     }
   }
 }

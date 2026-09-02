@@ -240,6 +240,10 @@ STUB
   # gets the real path the same way.
   TEST_CP="$(command -v cp)"
 
+  # Likewise awk: no program under test uses it, so it stays out of the
+  # farm. One test parses Panel.qml's nesting with it.
+  TEST_AWK="$(command -v awk)"
+
   chmod +x "$SANDBOX"/stub/*
   export PATH="$SANDBOX/stub:$SANDBOX/sysbin"
   export OMARCHY_VPN_CONNECTIONS="$HOME/.config/omarchy/vpn-connections.json"
@@ -3460,6 +3464,34 @@ test_panel_version_matches_the_manifest() {
 test_panel_shows_the_version_in_the_footer() {
   grep -q 'text: "v" + root.pluginVersion' "$PLUGIN_DIR/Panel.qml" || \
     fail "the version is declared but nowhere displayed"
+}
+
+# WHERE it stands matters, and grep cannot tell. The line was once a sibling
+# of panelColumn instead of its last child -- inside the ScrollView, which
+# takes its FIRST child as the content and parks any further one at the
+# origin. The version then appeared at the top right instead of the bottom,
+# while the grep above stayed green.
+#
+# Counting braces naively is what caused it: braces inside strings and
+# comments count too. This test strips both before counting, and so must
+# anyone moving the block.
+test_panel_version_sits_inside_the_scrolled_column() {
+  local verdict
+  verdict="$("$TEST_AWK" '
+    { line = $0
+      gsub(/"[^"]*"/, "\"\"", line)      # strings out
+      sub(/\/\/.*$/, "", line)          # line comments out
+      if (line ~ /id: panelColumn/) { inside = 1; depth = 1; next }
+      if (!inside) next
+      n = gsub(/\{/, "{", line); m = gsub(/\}/, "}", line)
+      depth += n - m
+      if ($0 ~ /text: "v" \+ root\.pluginVersion/) found = 1
+      if (depth <= 0) { inside = 0 }
+    }
+    END { print (found ? "inside" : "outside") }
+  ' "$PLUGIN_DIR/Panel.qml")"
+  [ "$verdict" = "inside" ] || \
+    fail "the version line is not inside panelColumn -- it would not render at the bottom"
 }
 
 # ---------------------------------------------- uninstall --system tests
