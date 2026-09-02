@@ -1,28 +1,93 @@
 #!/usr/bin/env bash
-# Deliberately almost a no-op. Neither the connection list nor the sudoers
-# entries nor the systemd units are touched -- they belong to the system,
-# not to this plugin.
+# Without --system deliberately almost a no-op. Neither the connection list
+# nor the sudoers entries nor the systemd units are touched -- they belong
+# to the system, not to this plugin.
 set -uo pipefail
 
+SYSTEM=false
+for arg in "$@"; do
+  case "$arg" in
+    --system) SYSTEM=true ;;
+    *) printf 'Usage: %s [--system]\n' "$0" >&2; exit 64 ;;
+  esac
+done
+
 CONF="${OMARCHY_VPN_CONNECTIONS:-$HOME/.config/omarchy/vpn-connections.json}"
+PRIV="${OMARCHY_VPN_PRIVILEGED:-/usr/local/bin/omarchy-vpn-privileged}"
+IMPORT="${OMARCHY_VPN_IMPORT:-/usr/local/bin/omarchy-vpn-import}"
+POLICY="${OMARCHY_VPN_POLICY:-/usr/share/polkit-1/actions/org.omarchy.smartalbvpn.import.policy}"
+SUDOERS="${OMARCHY_VPN_SUDOERS:-/etc/sudoers.d/smartalb-vpn}"
+
+if [ "$SYSTEM" = false ]; then
 cat <<EOF2
 Nothing to do. The connection list is kept:
   $CONF
 
 Not removed, because they live outside this plugin:
-  /usr/local/bin/omarchy-vpn-privileged
-  /usr/local/bin/omarchy-vpn-import
-  /usr/share/polkit-1/actions/org.omarchy.smartalbvpn.import.policy
-  /etc/sudoers.d/smartalb-vpn
+  $PRIV
+  $IMPORT
+  $POLICY
+  $SUDOERS
   /etc/openvpn/client/*.conf and /etc/wireguard/*.conf
 Running connections keep running.
+
+'./uninstall --system' removes the first four, and only those.
 
 Configurations created through the widget likewise stay behind in /etc.
 Whoever wants to be rid of them removes them through the widget itself
 before uninstalling (with 'also delete the file' ticked).
 
-Also not removed, but pointing nowhere afterwards: the entry
-  { "id": "smartalb.vpn" }
-under bar.layout.right in ~/.config/omarchy/shell.json. Remove it by hand,
-otherwise the bar keeps trying to load a plugin that is no longer there.
+The entry { "id": "smartalb.vpn" } under bar.layout.right in
+~/.config/omarchy/shell.json is removed by 'omarchy plugin remove
+smartalb.vpn'. After a manual installation, take it out by hand -- otherwise
+the bar keeps trying to load a plugin that is no longer there.
 EOF2
+exit 0
+fi
+
+# ----------------------------------------------------------- --system
+#
+# The four privileged artefacts, and nothing else. Not the connection list,
+# not the configurations in /etc, not running tunnels -- see the text above.
+gone=true
+
+drop() {
+  local path="$1" what="$2"
+  if [ ! -e "$path" ]; then
+    echo "not there: $path"
+    return 0
+  fi
+  gone=false
+  echo "removing $what: $path"
+  sudo rm -f "$path" || { echo "FAILED: could not remove $path" >&2; exit 1; }
+}
+
+# The sudoers rule goes FIRST -- the mirror of the order in 'install
+# --system', and for the same reason. Taking the program away first would
+# leave a rule pointing at nothing, and sudo does not treat a rule whose
+# program it cannot resolve as matching, so the missing program presents
+# itself as a missing permission. An interrupted run must not stop in that
+# state.
+if [ ! -e "$SUDOERS" ]; then
+  echo "not there: $SUDOERS"
+elif ! sudo grep -q "omarchy-vpn-privileged" "$SUDOERS" 2>/dev/null; then
+  # A file we did not write is none of our business. Without this check a
+  # mis-set path -- or a file somebody extended by hand -- would take other
+  # rules down with it.
+  echo "kept, not written by this plugin: $SUDOERS" >&2
+else
+  gone=false
+  echo "removing the sudoers rule: $SUDOERS"
+  sudo rm -f "$SUDOERS" || { echo "FAILED: could not remove $SUDOERS" >&2; exit 1; }
+fi
+
+drop "$PRIV"   "the switching program"
+drop "$IMPORT" "the import program"
+drop "$POLICY" "the polkit action"
+
+if [ "$gone" = true ]; then
+  echo "Nothing was there to remove."
+else
+  echo "Done. The connection list, the configurations in /etc and running"
+  echo "tunnels are untouched."
+fi

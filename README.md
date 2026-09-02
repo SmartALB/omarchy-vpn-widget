@@ -146,6 +146,41 @@ particular: it decides what may be written into `/etc`, so a fix in it only
 takes effect once the copy has been replaced.
 
 
+## Removing it again
+
+```bash
+omarchy plugin remove smartalb.vpn --yes
+```
+
+That takes the plugin directory and the entry in `shell.json`. What lives
+outside the plugin stays: the connection list, the two helper programs, the
+sudoers rule, the polkit action, the configurations in `/etc` -- and running
+tunnels keep running. `./uninstall` says as much and removes nothing.
+
+To take the privileged part away too, before removing the plugin:
+
+```bash
+cd ~/.config/omarchy/plugins/smartalb.vpn
+./uninstall --system
+```
+
+It removes exactly four things -- the two programs under `/usr/local/bin`,
+the polkit action and `/etc/sudoers.d/smartalb-vpn` -- and nothing else. Not
+the connection list, not the configurations in `/etc`, not a running tunnel.
+A sudoers file that does not mention this plugin's program it leaves alone
+and says so, so a mis-set path cannot take other rules with it.
+
+Here too the order is a contract, mirroring the installation: the rule goes
+first, the program it points at second. The other way round would leave, if
+the run is interrupted, a rule pointing at nothing -- and that state is hard
+to read, because `sudo` does not treat a rule whose program it cannot
+resolve as matching, so the missing program presents itself as a missing
+permission.
+
+**A tunnel that is up stays up.** Stop it before removing, or it keeps
+running with nothing left to switch it off with -- and it will hold its
+route against the next connection that wants the same network.
+
 ## Requirements
 
 - `jq`

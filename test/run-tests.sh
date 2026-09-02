@@ -3438,6 +3438,98 @@ test_inspect_and_import_agree_beyond_the_flat_openvpn_case() {
 # redirected through OMARCHY_VPN_CONNECTIONS inside the sandbox HOME.
 # No systemctl, no omarchy-vpn-toggle.
 
+# ---------------------------------------------- uninstall --system tests
+#
+# The counterpart to 'install --system'. Those four sudo rm commands were
+# typed by hand three times in one day while testing on a second machine --
+# the same kind of copying that produced two of the three mishaps there.
+
+# Helper: puts the four privileged artefacts in place so there is something
+# to remove.
+seed_system_artefacts() {
+  printf 'priv\n'   >"$OMARCHY_VPN_PRIVILEGED"
+  printf 'import\n' >"$OMARCHY_VPN_IMPORT"
+  printf 'policy\n' >"$OMARCHY_VPN_POLICY"
+  printf '%s ALL=(root) NOPASSWD: %s\n' "$(id -un)" "$OMARCHY_VPN_PRIVILEGED" >"$OMARCHY_VPN_SUDOERS"
+}
+
+test_uninstall_system_removes_all_four() {
+  seed_system_artefacts
+  "$PLUGIN_DIR/uninstall" --system >/dev/null 2>&1
+  [ ! -e "$OMARCHY_VPN_PRIVILEGED" ] || fail "the switching program is still there"
+  [ ! -e "$OMARCHY_VPN_IMPORT" ]     || fail "the import program is still there"
+  [ ! -e "$OMARCHY_VPN_POLICY" ]     || fail "the polkit action is still there"
+  [ ! -e "$OMARCHY_VPN_SUDOERS" ]    || fail "the sudoers file is still there"
+}
+
+# The mirror image of the install contract, and for the same reason. Taking
+# the program away first leaves a rule pointing at nothing -- the state in
+# which a missing program presents itself as a missing permission. If the
+# run is interrupted, it must not be interrupted INTO that state.
+test_uninstall_system_removes_rule_before_program() {
+  seed_system_artefacts
+  "$PLUGIN_DIR/uninstall" --system >/dev/null 2>&1
+  local sudoers_line priv_line
+  # Only the removals are compared, not any sudo call: reading the sudoers
+  # file to see whether it is ours legitimately happens first and names both
+  # paths, and must not be mistaken for a removal.
+  sudoers_line="$(grep -n "^rm .*$OMARCHY_VPN_SUDOERS" "$SANDBOX/sudo.log" | head -n1 | cut -d: -f1)"
+  priv_line="$(grep -n "^rm .*$OMARCHY_VPN_PRIVILEGED" "$SANDBOX/sudo.log" | head -n1 | cut -d: -f1)"
+  [ -n "$sudoers_line" ] || fail "the sudoers file was never removed" "$(cat "$SANDBOX/sudo.log")"
+  [ -n "$priv_line" ]    || fail "the switching program was never removed" "$(cat "$SANDBOX/sudo.log")"
+  [ "$sudoers_line" -lt "$priv_line" ] || \
+    fail "the program was taken away before the rule that points at it" "$(cat "$SANDBOX/sudo.log")"
+}
+
+# A sudoers file we did not write is none of our business. Without this a
+# mis-set path -- or a file somebody extended by hand -- would take other
+# rules down with it.
+test_uninstall_system_spares_a_foreign_sudoers_file() {
+  seed_system_artefacts
+  printf 'somebody ALL=(root) NOPASSWD: /usr/bin/somethingelse\n' >"$OMARCHY_VPN_SUDOERS"
+  local out
+  out="$("$PLUGIN_DIR/uninstall" --system 2>&1)"
+  [ -e "$OMARCHY_VPN_SUDOERS" ] || fail "a foreign sudoers file was deleted"
+  assert_contains "$out" "not written by this plugin"
+}
+
+# Repeatable: with nothing there it reports and removes nothing.
+#
+# The sandbox seeds the two helper programs and the polkit action itself, so
+# they are cleared first -- otherwise this would not be testing an empty
+# system but the sandbox's own furniture.
+test_uninstall_system_is_idempotent() {
+  local rc=0 out
+  rm -f "$OMARCHY_VPN_PRIVILEGED" "$OMARCHY_VPN_IMPORT" "$OMARCHY_VPN_POLICY" "$OMARCHY_VPN_SUDOERS"
+  out="$("$PLUGIN_DIR/uninstall" --system 2>&1)" || rc=$?
+  assert_eq "$rc" "0"
+  assert_contains "$out" "not there"
+  [ ! -f "$SANDBOX/sudo.log" ] || fail "something was removed although nothing was there" "$(cat "$SANDBOX/sudo.log")"
+}
+
+# The connection list belongs to the user, not to the plugin -- under no
+# circumstances is it removed along the way.
+test_uninstall_system_keeps_the_connection_list() {
+  seed_system_artefacts
+  printf '[]\n' >"$OMARCHY_VPN_CONNECTIONS"
+  "$PLUGIN_DIR/uninstall" --system >/dev/null 2>&1
+  [ -f "$OMARCHY_VPN_CONNECTIONS" ] || fail "the connection list was removed"
+}
+
+test_uninstall_without_system_calls_no_sudo() {
+  seed_system_artefacts
+  "$PLUGIN_DIR/uninstall" >/dev/null 2>&1
+  [ ! -f "$SANDBOX/sudo.log" ] || fail "plain uninstall called sudo" "$(cat "$SANDBOX/sudo.log")"
+  [ -e "$OMARCHY_VPN_PRIVILEGED" ] || fail "plain uninstall removed something"
+}
+
+test_uninstall_rejects_unknown_argument() {
+  local rc=0 out
+  out="$("$PLUGIN_DIR/uninstall" --wat 2>&1)" || rc=$?
+  assert_eq "$rc" "64"
+  assert_contains "$out" "Usage"
+}
+
 # ------------------------------------------------ install --system tests
 #
 # './install --system' performs the four privileged steps that used to be
