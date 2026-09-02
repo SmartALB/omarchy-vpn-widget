@@ -20,6 +20,8 @@ them runs without a password and the other does not.
 omarchy plugin add https://github.com/SmartALB/omarchy-vpn-widget --enable --yes
 ```
 
+The directory is named after the plugin id from the manifest, not after
+the repository: it lands in `~/.config/omarchy/plugins/smartalb.vpn/`.
 `--enable` also registers the widget in `~/.config/omarchy/shell.json`
 under `bar.layout.right`. Without it, or after a manual `git clone` into
 `~/.config/omarchy/plugins/`, either run `omarchy plugin enable
@@ -58,7 +60,7 @@ sudo install -m 755 -o root -g root \
   ~/.config/omarchy/plugins/smartalb.vpn/share/omarchy-vpn-privileged \
   /usr/local/bin/omarchy-vpn-privileged
 
-printf '%s ALL=(root) NOPASSWD: /usr/local/bin/omarchy-vpn-privileged\n' "$USER" \
+printf '%s ALL=(root) NOPASSWD: %s\n' "$USER" /usr/local/bin/omarchy-vpn-privileged \
   | sudo tee /tmp/smartalb-vpn.new >/dev/null
 sudo visudo -c -f /tmp/smartalb-vpn.new
 sudo install -m 440 -o root -g root /tmp/smartalb-vpn.new /etc/sudoers.d/smartalb-vpn
