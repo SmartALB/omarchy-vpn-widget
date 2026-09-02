@@ -14,6 +14,23 @@ deliberately not accepted; the reason is under "What gets accepted -- and
 why not more". WireGuard is not affected by this at all: it authenticates by
 key and has no notion of a password.
 
+**When something else fits better.** This widget drives systemd units --
+`openvpn-client@<name>` and `wg-quick@<name>` -- and that is a deliberate
+choice with a cost. It is the right one when other units depend on the
+tunnel: a mount that requires it, a service that should not start before it,
+a connection that has to be up at boot. systemd knows those dependencies,
+and `systemctl list-dependencies --reverse wg-quick@<name>` shows them.
+
+The cost is one passwordless sudoers line. There are widgets that avoid it
+by going through NetworkManager over D-Bus, authorized by polkit: no sudoers
+rule, no root-owned helper, and for a VPN you switch by hand in a desktop
+session that is the better trade. What they cannot do is drive a systemd
+unit, so a mount that requires `wg-quick@office` stays unserved by them.
+
+Pick by that question, not by the feature list: **is the tunnel part of your
+system, or part of your session?** If nothing but you depends on it, a
+NetworkManager widget asks less of your machine than this one does.
+
 ![The panel: connection list on top, the file picker below](images/panel-add-connection.png)
 
 ## Installation
