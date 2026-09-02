@@ -766,6 +766,14 @@ your own line. Whether that matters depends on your setup -- if access runs
 over a second, independent route (Tailscale, say), you stay reachable; if
 the VPN tunnel itself leads to the machine, the session is gone.
 
+## Contributing
+
+Issues are welcome -- bug reports, rejected configurations, suggestions.
+Pull requests are not accepted: this repository is a published snapshot of
+a working repository kept elsewhere, and a merged patch would be
+overwritten by the next release without a conflict. See
+[CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## Tests
 
 ```bash
