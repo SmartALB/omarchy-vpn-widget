@@ -612,6 +612,43 @@ If both are in place and switching still fails, the cause is no longer the
 setup but the unit -- carry on with the next section and with
 `journalctl -u <unit>`.
 
+### `RTNETLINK answers: File exists`
+
+Two tunnels into the same network collide over the route. The second
+`wg-quick` gets as far as the route and then aborts; it tears its own
+interface down again, so the unit ends in `failed` and no tunnel is left:
+
+```
+[#] ip -4 route add 10.42.0.0/23 dev <name>
+RTNETLINK answers: File exists
+[#] ip link delete dev <name>
+```
+
+`group` is there for exactly this, and it settles the case among the
+connections in the list: starting one stops the others in its group first.
+What it cannot see is a unit that is **not** in the list. Such a unit is
+easy to end up with:
+
+- a connection that used to be in the list under a different name and was
+  started once -- the tunnel keeps running,
+- a tunnel that was already up before the plugin was installed or
+  reinstalled. Removing the plugin does not stop anything; `uninstall`
+  says as much.
+
+The list then shows one connection in `failed` while another, invisible to
+it, holds the route. What is actually running:
+
+```bash
+ip route show 10.42.0.0/23
+ip -brief link show type wireguard
+systemctl list-units 'wg-quick@*' --all
+```
+
+Stop the leftover unit with `sudo systemctl stop wg-quick@<name>`, and if
+its configuration in `/etc/wireguard/` is not needed any more, remove that
+too -- otherwise the name will get in the way the next time a connection is
+created.
+
 ### When the displayed state is wrong
 
 `omarchy-vpn-list` reads nothing but `systemctl is-active` -- what happens
