@@ -36,7 +36,7 @@ actions and each requests its own authorization.
 - Bash, jq, systemd, coreutils (`timeout`), util-linux (`flock`), Polkit (`pkexec`).
 - OpenVPN and/or wireguard-tools for the corresponding unit templates.
 - `systemd-resolvconf` for WireGuard profiles using `DNS =`.
-- Qt 6 QML tools for tests only.
+- Python 3 and Qt 6 QML tools for tests only.
 
 The plugin does not install dependencies automatically. System services and
 other applications may depend on VPN units; check that before disconnecting.
