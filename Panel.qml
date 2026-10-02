@@ -60,7 +60,7 @@ Panel {
     return root.runner("{ " + cmd + " ; } 2> >(head -c " + root.maxOutBytes + " >&2)")
   }
 
-  readonly property string pluginVersion: "1.4.0"
+  readonly property string pluginVersion: "2.0.0"
 
   property var connections: []
   property string loadError: ""
@@ -423,6 +423,9 @@ Panel {
     }
     onExited: function(exitCode, exitStatus) {
       if (exitCode === 0) root.toggleError = ""
+      else if (exitCode === 124 || exitCode === 137)
+        root.toggleError = "VPN request timed out. Check the service state; a systemd job may still be running."
+      else if (root.toggleError === "") root.toggleError = "VPN request failed or authentication was cancelled."
       root.refresh()
     }
   }

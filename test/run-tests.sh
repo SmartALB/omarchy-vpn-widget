@@ -43,10 +43,12 @@ assert_contains() {
 #   $SANDBOX/pkexec.log     -> every pkexec call, one line per call
 #   $SANDBOX/pkexec-cancels -> if present, pkexec aborts with 126
 setup_sandbox() {
-  SANDBOX="$(mktemp -d)"
+  SANDBOX="$(mktemp -d)" || exit 1
   trap 'rm -rf "$SANDBOX"' EXIT
   export HOME="$SANDBOX/home"
   mkdir -p "$HOME/.config/omarchy" "$SANDBOX/stub" "$SANDBOX/sysbin" "$SANDBOX/state"
+  mkdir -p "$SANDBOX/tmp"
+  export TMPDIR="$SANDBOX/tmp"
 
   mkdir -p "$SANDBOX/sysbin"
   local tool
@@ -57,6 +59,7 @@ setup_sandbox() {
       ln -sf "$toolpath" "$SANDBOX/sysbin/$tool"
     else
       echo "setup_sandbox: tool not found: $tool" >&2
+      exit 1
     fi
   done
 
@@ -67,7 +70,7 @@ action="\${1:-}"; shift || true
 # Skip --dry-run and --, so that the unit name is what is left over.
 unit=""
 for a in "\$@"; do case "\$a" in --*|-) ;; *) unit="\$a";; esac; done
-statefile="$SANDBOX/state/\$unit"
+statefile="$SANDBOX/state/\${unit%.service}"
 case "\$action" in
   is-active)
     # exec instead of a plain 'sleep', for the same reason as at 'start'
@@ -140,6 +143,21 @@ fi
 echo "\${3:-}: parsed OK"
 STUB
 
+  cat >"$SANDBOX/stub/stat" <<'STUB'
+#!/bin/bash
+# Ownership is simulated only for the metadata-aware idempotence predicate.
+if [ "${1:-}" = -c ] && [ "${2:-}" = '%u:%g:%a' ]; then
+  printf '0:0:%s\n' "$(/usr/bin/stat -c %a "$3")"
+else
+  exec /usr/bin/stat "$@"
+fi
+STUB
+  cat >"$SANDBOX/stub/rm" <<STUB
+#!/bin/bash
+printf '%s\n' "\$*" >>"$SANDBOX/rm.log"
+exec /usr/bin/rm "\$@"
+STUB
+
   cat >"$SANDBOX/stub/pkexec" <<STUB
 #!/usr/bin/env bash
 # Stands in for the password dialog. Runs the command -- or aborts with
@@ -162,7 +180,9 @@ STUB
     echo "setup_sandbox: share/omarchy-vpn-privileged is missing" >&2
     exit 1
   fi
-  sed 's#^SYSTEMCTL=/usr/bin/systemctl$#SYSTEMCTL=systemctl#' \
+  sed -e "s#^SYSTEMCTL=/usr/bin/systemctl\$#SYSTEMCTL=$SANDBOX/stub/systemctl#" \
+      -e "s#^LOCK=/run/omarchy-vpn-switch.lock\$#LOCK=$SANDBOX/switch.lock#" \
+      -e 's#^MAX_SECONDS=90$#MAX_SECONDS=2#' \
     "$PLUGIN_DIR/share/omarchy-vpn-privileged" >"$SANDBOX/priv/omarchy-vpn-privileged"
   # A hard safeguard: a silently failed substitution would let a real
   # 'systemctl start' loose on a real VPN unit.
@@ -170,6 +190,8 @@ STUB
     echo "setup_sandbox: substitution failed, the copy still points at /usr/bin/systemctl" >&2
     exit 1
   fi
+  grep -Fxq "SYSTEMCTL=$SANDBOX/stub/systemctl" "$SANDBOX/priv/omarchy-vpn-privileged" || exit 1
+  grep -Fxq "LOCK=$SANDBOX/switch.lock" "$SANDBOX/priv/omarchy-vpn-privileged" || exit 1
   chmod +x "$SANDBOX/priv/omarchy-vpn-privileged"
 
   # Second copy: the import program, with its target directories pointing
@@ -256,6 +278,8 @@ STUB
   export OMARCHY_VPN_PRIVILEGED="$SANDBOX/priv/omarchy-vpn-privileged"
   export OMARCHY_VPN_IMPORT="$SANDBOX/priv/omarchy-vpn-import"
   export OMARCHY_VPN_POLICY="$SANDBOX/polkit-actions/org.omarchy.smartalbvpn.import.policy"
+  export OMARCHY_VPN_SWITCH_POLICY="$SANDBOX/polkit-actions/org.omarchy.smartalbvpn.switch.policy"
+  export OMARCHY_VPN_LEGACY_PRIVILEGED="$SANDBOX/priv/legacy-helper"
   mkdir -p "$SANDBOX/sudoers.d"
   export OMARCHY_VPN_SUDOERS="$SANDBOX/sudoers.d/smartalb-vpn"
 
@@ -278,7 +302,7 @@ set_state() {
 
 run_test() {
   local name="$1" out
-  if out="$(setup_sandbox; "$name" 2>&1)"; then
+  if out="$(setup_sandbox && "$name" 2>&1)"; then
     printf 'ok   %s\n' "$name"
     PASS=$((PASS + 1))
   else
@@ -640,23 +664,23 @@ test_list_without_json_flag_is_usage_error() {
 
 test_toggle_starts_inactive_connection() {
   "$BIN/omarchy-vpn-toggle" wg-home || fail "toggle failed"
-  assert_contains "$(cat "$SANDBOX/systemctl.log")" "start wg-quick@HomeNet"
+  assert_contains "$(cat "$SANDBOX/systemctl.log")" "start -- wg-quick@HomeNet.service"
   assert_eq "$(cat "$SANDBOX/state/wg-quick@HomeNet")" "active"
 }
 
 test_toggle_stops_active_connection() {
   set_state "wg-quick@HomeNet" active
   "$BIN/omarchy-vpn-toggle" wg-home || fail "toggle failed"
-  assert_contains "$(cat "$SANDBOX/systemctl.log")" "stop wg-quick@HomeNet"
+  assert_contains "$(cat "$SANDBOX/systemctl.log")" "stop -- wg-quick@HomeNet.service"
   assert_eq "$(cat "$SANDBOX/state/wg-quick@HomeNet")" "inactive"
 }
 
 test_toggle_treats_failed_as_not_running() {
   set_state "wg-quick@HomeNet" failed
   "$BIN/omarchy-vpn-toggle" wg-home || fail "toggle failed"
-  assert_contains "$(cat "$SANDBOX/systemctl.log")" "start wg-quick@HomeNet"
+  assert_contains "$(cat "$SANDBOX/systemctl.log")" "start -- wg-quick@HomeNet.service"
   case "$(cat "$SANDBOX/systemctl.log")" in
-    *"stop wg-quick@HomeNet"*) fail "a failed unit should not have been stopped" ;;
+    *"stop -- wg-quick@HomeNet.service"*) fail "a failed unit should not have been stopped" ;;
   esac
 }
 
@@ -666,8 +690,8 @@ test_toggle_stops_group_partner_before_starting() {
   # The order is the point: partner down first, then the new one up.
   local stop_line start_line log
   log="$(grep -n "openvpn-client" "$SANDBOX/systemctl.log")"
-  stop_line="$(printf '%s' "$log" | grep "stop openvpn-client@Example_29" | cut -d: -f1)"
-  start_line="$(printf '%s' "$log" | grep "start openvpn-client@Example_26" | cut -d: -f1)"
+  stop_line="$(printf '%s' "$log" | grep "stop -- openvpn-client@Example_29.service" | cut -d: -f1)"
+  start_line="$(printf '%s' "$log" | grep "start -- openvpn-client@Example_26.service" | cut -d: -f1)"
   [ -n "$stop_line" ] || fail "the group partner was not stopped"
   [ -n "$start_line" ] || fail "the target was not started"
   [ "$stop_line" -lt "$start_line" ] || fail "the start came before the stop of the partner"
@@ -685,12 +709,12 @@ test_toggle_stops_group_partner_when_activating() {
   local log
   log="$(cat "$SANDBOX/systemctl.log")"
   case "$log" in
-    *"stop openvpn-client@Example_29"*) ;;
+    *"stop -- openvpn-client@Example_29.service"*) ;;
     *) fail "the activating partner was not stopped -- two tunnels ran at once" ;;
   esac
   local stop_line start_line
-  stop_line="$(printf '%s' "$log" | grep -n "stop openvpn-client@Example_29" | cut -d: -f1)"
-  start_line="$(printf '%s' "$log" | grep -n "start openvpn-client@Example_26" | cut -d: -f1)"
+  stop_line="$(printf '%s' "$log" | grep -n "stop -- openvpn-client@Example_29.service" | cut -d: -f1)"
+  start_line="$(printf '%s' "$log" | grep -n "start -- openvpn-client@Example_26.service" | cut -d: -f1)"
   [ "$stop_line" -lt "$start_line" ] || fail "the start came before the stop of the activating partner"
 }
 
@@ -700,7 +724,7 @@ test_toggle_leaves_other_groups_alone() {
   "$BIN/omarchy-vpn-toggle" example-26 || fail "toggle failed"
   assert_eq "$(cat "$SANDBOX/state/wg-quick@HomeNet")" "active"
   case "$(cat "$SANDBOX/systemctl.log")" in
-    *"stop wg-quick@HomeNet"*) fail "WireGuard should not have been touched" ;;
+    *"stop -- wg-quick@HomeNet.service"*) fail "WireGuard should not have been touched" ;;
   esac
 }
 
@@ -711,7 +735,7 @@ test_toggle_does_not_start_when_partner_stop_fails() {
   "$BIN/omarchy-vpn-toggle" example-26 >/dev/null 2>&1 || rc=$?
   assert_eq "$rc" "4"
   case "$(cat "$SANDBOX/systemctl.log")" in
-    *"start openvpn-client@Example_26"*) fail "the start should have been left out" ;;
+    *"start -- openvpn-client@Example_26.service"*) fail "the start should have been left out" ;;
   esac
 }
 
@@ -720,15 +744,15 @@ test_toggle_reports_start_failure() {
   : >"$SANDBOX/fail-start"
   out="$("$BIN/omarchy-vpn-toggle" wg-home 2>&1)" || rc=$?
   assert_eq "$rc" "4"
-  assert_contains "$out" "failed:"
+  assert_contains "$out" "failed."
 }
 
-test_toggle_reports_denied_sudo() {
+test_toggle_reports_cancelled_polkit() {
   local rc=0 out
-  : >"$SANDBOX/sudo-denies"
+  : >"$SANDBOX/pkexec-cancels"
   out="$("$BIN/omarchy-vpn-toggle" wg-home 2>&1)" || rc=$?
   assert_eq "$rc" "4"
-  assert_contains "$out" "password"
+  assert_contains "$out" "authentication cancelled"
 }
 
 test_toggle_rejects_unknown_id() {
@@ -794,7 +818,7 @@ test_toggle_start_timeout_reports_it_and_exits_distinctly() {
   : >"$SANDBOX/hang-start"
   out="$("$BIN/omarchy-vpn-toggle" wg-home 2>&1)" || rc=$?
   assert_eq "$rc" "6"
-  assert_contains "$out" "timed out after"
+  assert_contains "$out" "timed out"
   case "$(cat "$SANDBOX/state/wg-quick@HomeNet" 2>/dev/null)" in
     active) fail "the timeout should not have reported the unit as active" ;;
   esac
@@ -807,8 +831,9 @@ test_toggle_start_timeout_reports_it_and_exits_distinctly() {
 test_toggle_calls_privileged_helper() {
   "$BIN/omarchy-vpn-toggle" wg-home || fail "toggle failed"
   local sudolog
-  sudolog="$(cat "$SANDBOX/sudo.log")"
-  assert_contains "$sudolog" "$OMARCHY_VPN_PRIVILEGED start wg-quick@HomeNet"
+  sudolog="$(cat "$SANDBOX/pkexec.log")"
+  assert_contains "$sudolog" "$OMARCHY_VPN_PRIVILEGED switch wg-quick@HomeNet"
+  [ ! -s "$SANDBOX/sudo.log" ] || fail "toggle invoked sudo"
   case "$sudolog" in
     *"systemctl start"*|*"systemctl stop"*)
       fail "toggle still calls systemctl directly through sudo" "log: $sudolog" ;;
@@ -824,7 +849,7 @@ test_toggle_reports_missing_helper() {
   export OMARCHY_VPN_PRIVILEGED="$SANDBOX/doesnotexist/omarchy-vpn-privileged"
   out="$("$BIN/omarchy-vpn-toggle" wg-home 2>&1)" || rc=$?
   assert_eq "$rc" "4"
-  assert_contains "$out" "failed:"
+  assert_contains "$out" "helper missing"
 }
 
 # The counterpart from the user's point of view: a connection list with a
@@ -838,7 +863,7 @@ test_toggle_reports_helper_rejection() {
 [{ "id": "evil", "label": "Foreign unit", "unit": "sshd" }]
 JSON
   out="$("$BIN/omarchy-vpn-toggle" evil 2>&1)" || rc=$?
-  assert_eq "$rc" "4"
+  assert_eq "$rc" "5"
   assert_contains "$out" "disallowed unit name"
   assert_contains "$out" "sshd"
   [ ! -e "$SANDBOX/systemctl.log" ] || \
@@ -871,7 +896,7 @@ test_privileged_copy_points_at_the_stub() {
   case "$(cat "$OMARCHY_VPN_PRIVILEGED")" in
     *"/usr/bin/systemctl"*) fail "the copy still points at the real systemctl" ;;
   esac
-  assert_contains "$(cat "$OMARCHY_VPN_PRIVILEGED")" "SYSTEMCTL=systemctl"
+  assert_contains "$(cat "$OMARCHY_VPN_PRIVILEGED")" "SYSTEMCTL=$SANDBOX/stub/systemctl"
 }
 
 test_privileged_accepts_valid_calls() {
@@ -884,10 +909,10 @@ test_privileged_accepts_valid_calls() {
 
   local log
   log="$(cat "$SANDBOX/systemctl.log")"
-  assert_contains "$log" "start openvpn-client@Example_29"
-  assert_contains "$log" "stop wg-quick@HomeNet"
-  assert_contains "$log" "start openvpn-client@a_b.c-d1"
-  assert_contains "$log" "stop wg-quick@x.service"
+  assert_contains "$log" "start -- openvpn-client@Example_29.service"
+  assert_contains "$log" "stop -- wg-quick@HomeNet.service"
+  assert_contains "$log" "start -- openvpn-client@a_b.c-d1.service"
+  assert_contains "$log" "stop -- wg-quick@x.service"
 }
 
 test_privileged_rejects_bad_action() {
@@ -3740,7 +3765,8 @@ seed_system_artefacts() {
   printf 'priv\n'   >"$OMARCHY_VPN_PRIVILEGED"
   printf 'import\n' >"$OMARCHY_VPN_IMPORT"
   printf 'policy\n' >"$OMARCHY_VPN_POLICY"
-  printf '%s ALL=(root) NOPASSWD: %s\n' "$(id -un)" "$OMARCHY_VPN_PRIVILEGED" >"$OMARCHY_VPN_SUDOERS"
+  printf 'policy\n' >"$OMARCHY_VPN_SWITCH_POLICY"
+  printf '%s ALL=(root) NOPASSWD: %s\n' "$(id -un)" "$OMARCHY_VPN_LEGACY_PRIVILEGED" >"$OMARCHY_VPN_SUDOERS"
 }
 
 test_uninstall_system_removes_all_four() {
@@ -3749,6 +3775,7 @@ test_uninstall_system_removes_all_four() {
   [ ! -e "$OMARCHY_VPN_PRIVILEGED" ] || fail "the switching program is still there"
   [ ! -e "$OMARCHY_VPN_IMPORT" ]     || fail "the import program is still there"
   [ ! -e "$OMARCHY_VPN_POLICY" ]     || fail "the polkit action is still there"
+  [ ! -e "$OMARCHY_VPN_SWITCH_POLICY" ] || fail "the switching policy is still there"
   [ ! -e "$OMARCHY_VPN_SUDOERS" ]    || fail "the sudoers file is still there"
 }
 
@@ -3763,8 +3790,8 @@ test_uninstall_system_removes_rule_before_program() {
   # Only the removals are compared, not any sudo call: reading the sudoers
   # file to see whether it is ours legitimately happens first and names both
   # paths, and must not be mistaken for a removal.
-  sudoers_line="$(grep -n "^rm .*$OMARCHY_VPN_SUDOERS" "$SANDBOX/sudo.log" | head -n1 | cut -d: -f1)"
-  priv_line="$(grep -n "^rm .*$OMARCHY_VPN_PRIVILEGED" "$SANDBOX/sudo.log" | head -n1 | cut -d: -f1)"
+  sudoers_line="$(grep -n -- "$OMARCHY_VPN_SUDOERS" "$SANDBOX/rm.log" | head -n1 | cut -d: -f1)"
+  priv_line="$(grep -n -- "$OMARCHY_VPN_PRIVILEGED" "$SANDBOX/rm.log" | head -n1 | cut -d: -f1)"
   [ -n "$sudoers_line" ] || fail "the sudoers file was never removed" "$(cat "$SANDBOX/sudo.log")"
   [ -n "$priv_line" ]    || fail "the switching program was never removed" "$(cat "$SANDBOX/sudo.log")"
   [ "$sudoers_line" -lt "$priv_line" ] || \
@@ -3780,7 +3807,7 @@ test_uninstall_system_spares_a_foreign_sudoers_file() {
   local out
   out="$("$PLUGIN_DIR/uninstall" --system 2>&1)"
   [ -e "$OMARCHY_VPN_SUDOERS" ] || fail "a foreign sudoers file was deleted"
-  assert_contains "$out" "not written by this plugin"
+  assert_contains "$out" "manual review required"
 }
 
 # Repeatable: with nothing there it reports and removes nothing.
@@ -3793,8 +3820,8 @@ test_uninstall_system_is_idempotent() {
   rm -f "$OMARCHY_VPN_PRIVILEGED" "$OMARCHY_VPN_IMPORT" "$OMARCHY_VPN_POLICY" "$OMARCHY_VPN_SUDOERS"
   out="$("$PLUGIN_DIR/uninstall" --system 2>&1)" || rc=$?
   assert_eq "$rc" "0"
-  assert_contains "$out" "not there"
-  [ ! -f "$SANDBOX/sudo.log" ] || fail "something was removed although nothing was there" "$(cat "$SANDBOX/sudo.log")"
+  assert_contains "$out" "untouched"
+  [ ! -e "$OMARCHY_VPN_PRIVILEGED" ] || fail "uninstall created a helper"
 }
 
 # The connection list belongs to the user, not to the plugin -- under no
@@ -3893,23 +3920,17 @@ test_install_system_hands_root_no_plugin_path() {
 
 # The sudoers subject is the numeric uid. A login name is text that sudoers
 # interprets: an account called 'ALL' would change what the rule means.
-test_install_system_binds_the_numeric_uid() {
-  "$PLUGIN_DIR/install" --system >/dev/null 2>&1
-  [ -f "$OMARCHY_VPN_SUDOERS" ] || fail "no sudoers file was written"
-  local body; body="$(cat "$OMARCHY_VPN_SUDOERS")"
-  case "$body" in
-    "#$(id -u) ALL=(root) NOPASSWD: "*) ;;
-    *) fail "the rule does not bind the numeric uid" "$body" ;;
-  esac
-  case "$body" in
-    *"$(id -un)"*) fail "the login name appears in the rule" "$body" ;;
-  esac
+test_install_system_creates_no_sudoers_grant() {
+  "$PLUGIN_DIR/install" --system >/dev/null 2>&1 || fail "installation failed"
+  [ ! -e "$OMARCHY_VPN_SUDOERS" ] || fail "a sudoers grant was created"
+  [ ! -s "$SANDBOX/visudo.log" ] || fail "sudoers validation unexpectedly invoked"
+  cmp -s "$PLUGIN_DIR/share/omarchy-vpn-switch.policy" "$OMARCHY_VPN_SWITCH_POLICY" || fail "switch policy missing or changed"
 }
 
 # If the grant cannot be published, what was already replaced goes back.
 # Otherwise an interrupted run leaves a half-updated privileged program
 # behind with no rule, or an old rule pointing at a new binary.
-test_install_system_rolls_back_when_the_grant_fails() {
+test_install_system_rolls_back_when_policy_publication_fails() {
   seed_system_artefacts
   printf 'the previous helper\n' >"$OMARCHY_VPN_PRIVILEGED"
   printf 'the previous importer\n' >"$OMARCHY_VPN_IMPORT"
@@ -3918,9 +3939,10 @@ test_install_system_rolls_back_when_the_grant_fails() {
   # undoing and the test would pass without a rollback existing at all --
   # which is exactly what a mutation probe caught. An unreachable
   # destination fails at the last of the four writes instead.
-  export OMARCHY_VPN_SUDOERS="$SANDBOX/no-such-dir/smartalb-vpn"
+  export OMARCHY_VPN_SWITCH_POLICY="$SANDBOX/no-such-dir/switch.policy"
   "$PLUGIN_DIR/install" --system >/dev/null 2>&1
-  [ ! -e "$OMARCHY_VPN_SUDOERS" ] || fail "the grant was published although its directory is missing"
+  [ ! -e "$OMARCHY_VPN_SWITCH_POLICY" ] || fail "the policy was published although its directory is missing"
+  [ ! -e "$OMARCHY_VPN_SUDOERS" ] || fail "legacy grant was restored after failure"
   assert_eq "$(cat "$OMARCHY_VPN_PRIVILEGED")" "the previous helper"
   assert_eq "$(cat "$OMARCHY_VPN_IMPORT")" "the previous importer"
 }
@@ -3930,27 +3952,27 @@ test_install_system_rolls_back_when_the_grant_fails() {
 # nothing -- and that is exactly the state which cost an hour on the laptop,
 # because sudo does not treat a rule whose program it cannot resolve as
 # matching, so a missing program looks like a missing permission.
-test_install_system_installs_program_before_sudoers_rule() {
+test_install_system_installs_program_before_switch_policy() {
   local out priv_line rule_line
   out="$("$PLUGIN_DIR/install" --system 2>&1)"
   # Measured on what the program reports, not on how it called sudo: there
   # is only one call now, and the order lives inside it.
   priv_line="$(printf '%s\n' "$out" | grep -n "installing $OMARCHY_VPN_PRIVILEGED\$" | head -n1 | cut -d: -f1)"
-  rule_line="$(printf '%s\n' "$out" | grep -n "installing $OMARCHY_VPN_SUDOERS\$" | head -n1 | cut -d: -f1)"
+  rule_line="$(printf '%s\n' "$out" | grep -n "installing $OMARCHY_VPN_SWITCH_POLICY\$" | head -n1 | cut -d: -f1)"
   [ -n "$priv_line" ] || fail "the switching program was never installed" "$out"
-  [ -n "$rule_line" ] || fail "the sudoers rule was never installed" "$out"
+  [ -n "$rule_line" ] || fail "the switching policy was never installed" "$out"
   [ "$priv_line" -lt "$rule_line" ] || \
-    fail "the sudoers rule was put in place before the program it points at" "$out"
+    fail "the switching policy was put in place before the program it points at" "$out"
 }
 
 # A rejected sudoers file must not reach its destination -- that is the whole
 # reason for the detour through a temporary file.
-test_install_system_keeps_rejected_sudoers_out() {
+test_install_system_keeps_custom_legacy_sudoers() {
   local rc=0
-  : >"$SANDBOX/visudo-rejects"
+  printf 'custom rule\n' >"$OMARCHY_VPN_SUDOERS"
   "$PLUGIN_DIR/install" --system >/dev/null 2>&1 || rc=$?
-  [ "$rc" -ne 0 ] || fail "a rejected sudoers file was reported as success"
-  [ ! -f "$OMARCHY_VPN_SUDOERS" ] ||     fail "the rejected file was put into place anyway" "$(cat "$OMARCHY_VPN_SUDOERS")"
+  [ "$rc" -ne 0 ] || fail "a custom legacy rule was accepted"
+  assert_eq "$(cat "$OMARCHY_VPN_SUDOERS")" "custom rule"
 }
 
 # ... and it must not leave its scratch file behind either.
@@ -3960,18 +3982,9 @@ test_install_system_keeps_rejected_sudoers_out() {
 # green for ever if the implementation chose a different one; this way the
 # test fails when no scratch file is written at all.
 test_install_system_leaves_no_scratch_file_after_rejection() {
-  : >"$SANDBOX/visudo-rejects"
+  printf 'custom rule\n' >"$OMARCHY_VPN_SUDOERS"
   "$PLUGIN_DIR/install" --system >/dev/null 2>&1
-  local scratch
-  # The path is read back out of the visudo log rather than guessed. Under
-  # the old shape it lay in the user's /tmp and could be swapped between the
-  # check and the install; it now lives in root's own staging directory and
-  # has to be gone afterwards either way.
-  scratch="$(sed -n 's/.*-f \(\/[^ ]*\).*/\1/p' "$SANDBOX/visudo.log" 2>/dev/null | head -n1)"
-  [ -n "$scratch" ] || \
-    fail "visudo was never handed a file -- the check was skipped" \
-         "$(cat "$SANDBOX/visudo.log" 2>/dev/null)"
-  [ ! -e "$scratch" ] || fail "the staged file was left behind" "$scratch"
+  [ -z "$(find "$TMPDIR" -mindepth 1 -maxdepth 1 -print)" ] || fail "staging files survived rejection"
 }
 
 # Repeatable: a second run over an unchanged system installs nothing again.
@@ -4152,7 +4165,9 @@ test_install_confirms_polkit_action_present() {
 test_install_makes_only_programs_executable() {
   local copy chmoddir
   copy="$SANDBOX/plugin-copy"
-  "$TEST_CP" -a "$PLUGIN_DIR" "$copy" || fail "could not copy the plugin"
+  mkdir -p "$copy/test"
+  "$TEST_CP" -a "$PLUGIN_DIR/bin" "$PLUGIN_DIR/share" "$PLUGIN_DIR/install" "$PLUGIN_DIR/uninstall" "$copy/" || fail "could not copy the plugin"
+  "$TEST_CP" "$PLUGIN_DIR/test/run-tests.sh" "$copy/test/"
   "$TEST_CHMOD" 644 "$copy/share/omarchy-vpn-privileged" "$copy/share/omarchy-vpn-import" \
                     "$copy/share/omarchy-vpn-import.policy" || fail "could not prepare permissions"
 
@@ -4239,7 +4254,7 @@ test_install_warns_about_outdated_helper() {
   out="$("$PLUGIN_DIR/install")"
   assert_contains "$out" "WARNING"
   assert_contains "$out" "differs from the shipped"
-  assert_contains "$out" "Repeat the install command"
+  assert_contains "$out" "Run ./install --system"
 }
 
 # Shows the second part of important 1, as far as that can be reproduced
@@ -4289,7 +4304,7 @@ main() {
     run_test "$t"
   done
   printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
-  [ "$FAIL" -eq 0 ]
+  [ "$FAIL" -eq 0 ] && [ "$PASS" -gt 0 ]
 }
 
 main "$@"

@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>smartalb.vpn</vendor>
+  <action id="org.omarchy.smartalbvpn.switch">
+    <description>Start, stop or switch a VPN connection</description>
+    <message>Authentication is required to change VPN services. Switching groups may stop the existing VPN before starting the selected connection.</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/local/bin/omarchy-vpn-switch</annotate>
+  </action>
+</policyconfig>

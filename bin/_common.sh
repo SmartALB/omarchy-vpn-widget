@@ -7,30 +7,23 @@
 CONNECTIONS_FILE="${OMARCHY_VPN_CONNECTIONS:-$HOME/.config/omarchy/vpn-connections.json}"
 SYSTEMCTL="${OMARCHY_VPN_SYSTEMCTL:-/usr/bin/systemctl}"
 
-# The helper program every switching operation goes through. It checks the
-# action and the unit name and then replaces itself with systemctl; this one
-# path is the only entry in /etc/sudoers.d/smartalb-vpn, and it is listed without
-# any restriction on the arguments -- the checking lives in the program, not
-# in sudoers. See share/omarchy-vpn-privileged and the README, section
-# Requirements.
+# The authenticated switching helper. A new path deliberately avoids reusing
+# the old helper's NOPASSWD grant. install --system performs legacy migration.
 #
 # Redirectable here, not there: this script runs as the user, the helper
 # program runs as root.
-VPN_PRIVILEGED="${OMARCHY_VPN_PRIVILEGED:-/usr/local/bin/omarchy-vpn-privileged}"
+VPN_PRIVILEGED="${OMARCHY_VPN_PRIVILEGED:-/usr/local/bin/omarchy-vpn-switch}"
 
-# The second privileged program: it places configurations into /etc. Unlike
-# VPN_PRIVILEGED it does NOT run without a password, but through pkexec with
-# a password dialog -- a configuration placed there is later executed with
-# system privileges. See share/omarchy-vpn-import.
+# Import and switching both use pkexec with auth_admin, without retention.
 IMPORT_BIN="${OMARCHY_VPN_IMPORT:-/usr/local/bin/omarchy-vpn-import}"
 
-# Upper bound for a single systemctl call, shared by 'list' and 'toggle'.
+# Upper bound for a read-only systemctl status call. Switching has a fixed
+# root-side operation budget independent of this user-controlled setting.
 # Not every unit bounds itself: wg-quick@<name> reports
 # TimeoutStartUSec=infinity. 'list' calls unit_state() once per connection
 # every 10s from the panel timer -- without this bound a stuck 'is-active'
 # freezes the panel on the stale state for good, with no error message
-# (review I5). 'toggle' uses the same variable for its own 'timeout'
-# wrapper around start/stop.
+# (review I5).
 SYSTEMCTL_TIMEOUT="${OMARCHY_VPN_TIMEOUT:-90}"
 
 need_jq() {
@@ -90,13 +83,7 @@ read_connections() {
 # suitable for the group check in toggle, see unit_needs_stop_for_group()
 # below.
 #
-# '--' before the unit name: harmless here, because 'is-active' runs
-# without sudo. run_systemctl() in omarchy-vpn-toggle must NOT add it --
-# there the second argument is the unit name, which
-# share/omarchy-vpn-privileged checks exactly; a '--' in front of it would
-# be read as the action and rejected with exit 65. There used to be a
-# different reason here (the old sudoers lines matched the command exactly,
-# without '--'); the rule has stayed the same, the reason is a new one.
+# '--' separates the unit from command options. This status query is unprivileged.
 unit_state() {
   local unit="$1" state
   state="$(timeout "$SYSTEMCTL_TIMEOUT" "$SYSTEMCTL" is-active -- "$unit" 2>/dev/null)" || true

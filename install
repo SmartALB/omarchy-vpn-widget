@@ -24,10 +24,12 @@ chmod +x "$DIR"/bin/* \
          "$DIR/install" "$DIR/uninstall" "$DIR/test/run-tests.sh" 2>/dev/null
 
 CONF="${OMARCHY_VPN_CONNECTIONS:-$HOME/.config/omarchy/vpn-connections.json}"
-PRIV="${OMARCHY_VPN_PRIVILEGED:-/usr/local/bin/omarchy-vpn-privileged}"
+PRIV="${OMARCHY_VPN_PRIVILEGED:-/usr/local/bin/omarchy-vpn-switch}"
 IMPORT="${OMARCHY_VPN_IMPORT:-/usr/local/bin/omarchy-vpn-import}"
 POLICY="${OMARCHY_VPN_POLICY:-/usr/share/polkit-1/actions/org.omarchy.smartalbvpn.import.policy}"
+SWITCH_POLICY="${OMARCHY_VPN_SWITCH_POLICY:-/usr/share/polkit-1/actions/org.omarchy.smartalbvpn.switch.policy}"
 SUDOERS="${OMARCHY_VPN_SUDOERS:-/etc/sudoers.d/smartalb-vpn}"
+LEGACY_PRIV="${OMARCHY_VPN_LEGACY_PRIVILEGED:-/usr/local/bin/omarchy-vpn-privileged}"
 
 HAVE_JQ=false
 command -v jq >/dev/null 2>&1 && HAVE_JQ=true
@@ -69,11 +71,7 @@ fi
 # merely a convenience (review M10).
 command -v timeout >/dev/null 2>&1 || say "WARNING: timeout missing -- omarchy-vpn-list and omarchy-vpn-toggle need it."
 
-# Whether the helper program is installed can be answered without
-# executing anything -- unlike the question whether passwordless sudo is
-# set up. For that there is still no harmless probe: a call with a real
-# unit could actually bring the connection up, and '--dry-run' is,
-# according to man(1) systemctl, not provided for the 'start' verb.
+# Inspect only: never start a VPN as an installation check.
 if [ -x "$PRIV" ]; then
   say "Helper program present: $PRIV"
 
@@ -82,20 +80,13 @@ if [ -x "$PRIV" ]; then
   # this step is for -- see the README, section Requirements.
   if ! cmp -s "$DIR/share/omarchy-vpn-privileged" "$PRIV"; then
     say "WARNING: $PRIV differs from the shipped share/omarchy-vpn-privileged"
-    say "         (outdated or modified). Repeat the install command:"
-    say ""
-    say "           sudo install -m 755 -o root -g root \\"
-    say "             \"$DIR/share/omarchy-vpn-privileged\" $PRIV"
-    say ""
+    say "         (outdated or modified). Run ./install --system after review."
   fi
 
   OWNER_MODE="$(stat -c '%U %a' "$PRIV" 2>/dev/null)"
   if [ "$OWNER_MODE" != "root 755" ]; then
     say "WARNING: $PRIV is not owned by root with mode 755 (found:"
-    say "         ${OWNER_MODE:-unknown}). A NOPASSWD rule on a file that is"
-    say "         not owned by root, or is writable too widely, is a root"
-    say "         shell. Correct it with:"
-    say "           sudo chown root:root $PRIV && sudo chmod 755 $PRIV"
+    say "         ${OWNER_MODE:-unknown}). Run ./install --system to repair it."
   fi
 
   PRIVDIR="$(dirname "$PRIV")"
@@ -107,28 +98,9 @@ if [ -x "$PRIV" ]; then
   fi
 else
   say "WARNING: helper program missing: $PRIV"
-  say "         Without it nothing can be switched. Once, as root:"
-  say ""
-  say "           sudo install -m 755 -o root -g root \\"
-  say "             \"$DIR/share/omarchy-vpn-privileged\" $PRIV"
-  say "           printf '%s ALL=(root) NOPASSWD: %s\\n' \"\$USER\" $PRIV \\"
-  say "             | sudo tee /tmp/smartalb-vpn.new >/dev/null"
-  say "           sudo visudo -c -f /tmp/smartalb-vpn.new"
-  say "           sudo install -m 440 -o root -g root /tmp/smartalb-vpn.new /etc/sudoers.d/smartalb-vpn"
-  say "           sudo rm -f /tmp/smartalb-vpn.new"
-  say "           sudo visudo -c"
-  say ""
-  say "         The order is deliberate: check the new line in a temporary"
-  say "         file first (visudo -c -f), and only then put it into"
-  say "         /etc/sudoers.d/. A typo written straight into the target"
-  say "         file would otherwise cripple every sudo on the machine"
-  say "         between the write and the correction."
-  say ""
-  say "         The helper program must be owned by root and must NOT be"
-  say "         writable for the user -- a NOPASSWD rule on a writable file"
-  say "         is a root shell. Hence into /usr/local/bin and not out of"
-  say "         the plugin directory."
+  say "         Run ./install --system as your normal user after reviewing the source."
 fi
+[ -r "$SWITCH_POLICY" ] || say "WARNING: switching polkit action missing: $SWITCH_POLICY"
 
 if [ -x "$IMPORT" ]; then
   say "Import helper program present: $IMPORT"
@@ -143,17 +115,15 @@ else
   say "           sudo install -m 644 -o root -g root \\"
   say "             \"$DIR/share/omarchy-vpn-import.policy\" $POLICY"
   say ""
-  say "         Unlike the switching program this one does NOT run without a"
-  say "         password: it writes into /etc, and a configuration placed"
+  say "         Like switching, importing requires authentication. It writes into /etc, and a configuration placed"
   say "         there is later executed with system privileges."
 fi
 
 command -v pkexec >/dev/null 2>&1 || \
   say "WARNING: pkexec missing (package polkit) -- without it there is no password dialog."
 
-say "Note: whether passwordless sudo really works shows on the first"
-say "      switch -- omarchy-vpn-toggle then says so clearly."
-say "      Everything privileged at once: ./install --system"
+say "Switching, importing and deleting require Polkit authentication (no retained authorization)."
+say "System installation and legacy migration: ./install --system"
 
 # ------------------------------------------------------------ --system
 #
@@ -168,12 +138,11 @@ say "      Everything privileged at once: ./install --system"
 # one asks for.
 [ "$SYSTEM" = true ] || exit 0
 
-# Running under sudo, $USER would be root and the rule would name root --
-# it would grant nothing to the person who is supposed to switch. FAKE_EUID
-# exists for the test suite, which cannot become root.
+# Resolve the original user for legacy-rule removal before elevation.
+# FAKE_EUID exists for the unprivileged test suite.
 if [ "${FAKE_EUID:-$(id -u)}" = "0" ]; then
   say "install --system must be run as your own user, not as root --"
-  say "otherwise the sudoers line names root instead of you."
+  say "otherwise legacy migration cannot identify your own old rule."
   exit 1
 fi
 
@@ -195,16 +164,15 @@ fi
 # of its own that nobody else can reach, and validates and publishes from
 # there. Nothing under $DIR is named to sudo at all.
 uid="$(id -u 2>/dev/null)"
+login="$(id -un 2>/dev/null)"
 case "${uid:-}" in
   ''|*[!0-9]*) say "FAILED: could not determine a numeric user id"; exit 1 ;;
 esac
 
-for f in omarchy-vpn-privileged omarchy-vpn-import omarchy-vpn-import.policy; do
+for f in omarchy-vpn-privileged omarchy-vpn-import omarchy-vpn-import.policy omarchy-vpn-switch.policy; do
   [ -r "$DIR/share/$f" ] || { say "FAILED: missing: share/$f"; exit 1; }
 done
 
-# The rule binds '#<uid>', not a login name. A name is text that sudoers
-# interprets -- an account called 'ALL' would change what the rule means.
 # The payload is read ONCE, into a copy, and bound to a digest taken from
 # exactly those bytes. Archiving straight out of the checkout meant tar
 # opened each file a second time, after the decision to install had been
@@ -220,33 +188,52 @@ done
 # against a published release.
 payload="$(mktemp -d)" || { say "FAILED: no staging directory"; exit 1; }
 trap 'rm -rf "$payload"' EXIT
-for f in omarchy-vpn-privileged omarchy-vpn-import omarchy-vpn-import.policy; do
+for f in omarchy-vpn-privileged omarchy-vpn-import omarchy-vpn-import.policy omarchy-vpn-switch.policy; do
   cat -- "$DIR/share/$f" >"$payload/$f" || { say "FAILED: could not read share/$f"; exit 1; }
 done
-digests="$(cd "$payload" && sha256sum omarchy-vpn-privileged omarchy-vpn-import omarchy-vpn-import.policy)" \
+digests="$(cd "$payload" && sha256sum omarchy-vpn-privileged omarchy-vpn-import omarchy-vpn-import.policy omarchy-vpn-switch.policy)" \
   || { say "FAILED: could not fingerprint the payload"; exit 1; }
 say "Payload fingerprints:"
 printf '  %s\n' "$digests"
 
 tar -C "$payload" -cf - \
-      omarchy-vpn-privileged omarchy-vpn-import omarchy-vpn-import.policy 2>/dev/null \
-  | sudo env VPN_UID="$uid" VPN_PRIV="$PRIV" VPN_IMPORT="$IMPORT" \
-         VPN_POLICY="$POLICY" VPN_SUDOERS="$SUDOERS" VPN_DIGESTS="$digests" bash -c '
+      omarchy-vpn-privileged omarchy-vpn-import omarchy-vpn-import.policy omarchy-vpn-switch.policy 2>/dev/null \
+  | sudo env VPN_UID="$uid" VPN_LOGIN="$login" VPN_LEGACY_PRIV="$LEGACY_PRIV" VPN_PRIV="$PRIV" VPN_IMPORT="$IMPORT" \
+         VPN_SWITCH_POLICY="$SWITCH_POLICY" VPN_POLICY="$POLICY" VPN_SUDOERS="$SUDOERS" VPN_DIGESTS="$digests" bash -p -c '
 set -uo pipefail
 umask 077
 
 case "${VPN_UID:-}" in ''"''"''|*[!0-9]*) echo "root: uid is not numeric" >&2; exit 1 ;; esac
-for v in VPN_PRIV VPN_IMPORT VPN_POLICY VPN_SUDOERS; do
+for v in VPN_PRIV VPN_IMPORT VPN_POLICY VPN_SWITCH_POLICY VPN_SUDOERS VPN_LEGACY_PRIV; do
   case "${!v}" in /*) ;; *) echo "root: $v is not an absolute path" >&2; exit 1 ;; esac
 done
 
 # mktemp -d already creates with mode 0700, owned by root -- no chmod, and
 # nothing but root can reach what is staged here.
 stage="$(mktemp -d)" || { echo "root: no staging directory" >&2; exit 1; }
-trap '"'"'rm -rf "$stage"'"'"' EXIT
+committed=false
+scratch=()
+finish() {
+  local rc=$? keep=false
+  trap - EXIT INT TERM HUP
+  if [ "$committed" != true ] && declare -F restore >/dev/null; then
+    restore || { rc=1; keep=true; }
+  fi
+  for path in "${scratch[@]}"; do rm -f -- "$path"; done
+  if [ "$keep" = true ]; then
+    echo "Rollback incomplete; root staging backups retained at $stage" >&2
+  else
+    rm -rf -- "$stage"
+  fi
+  exit "$rc"
+}
+trap finish EXIT
+trap '"'"'exit 130'"'"' INT
+trap '"'"'exit 143'"'"' TERM
+trap '"'"'exit 129'"'"' HUP
 tar -C "$stage" -xf - || { echo "root: could not unpack the payload" >&2; exit 1; }
 
-for f in omarchy-vpn-privileged omarchy-vpn-import omarchy-vpn-import.policy; do
+for f in omarchy-vpn-privileged omarchy-vpn-import omarchy-vpn-import.policy omarchy-vpn-switch.policy; do
   [ -f "$stage/$f" ] && [ ! -L "$stage/$f" ] || { echo "root: payload incomplete: $f" >&2; exit 1; }
 done
 
@@ -259,55 +246,67 @@ printf "%s\n" "$VPN_DIGESTS" >"$stage/digests"
 }
 rm -f "$stage/digests"
 
-printf "#%s ALL=(root) NOPASSWD: %s\n" "$VPN_UID" "$VPN_PRIV" >"$stage/sudoers"
-if ! visudo -c -f "$stage/sudoers" >/dev/null; then
-  echo "root: the generated sudoers rule was rejected -- nothing was changed" >&2
-  exit 1
+# Legacy migration: revoke only an exact rule formerly emitted for this user.
+# A custom/extended rule or non-regular path is never silently removed.
+if [ -e "$VPN_SUDOERS" ] || [ -L "$VPN_SUDOERS" ]; then
+  [ -f "$VPN_SUDOERS" ] && [ ! -L "$VPN_SUDOERS" ] || { echo "root: legacy sudoers path is not a plain file" >&2; exit 1; }
+  [ "$(stat -c %s "$VPN_SUDOERS")" -le 1024 ] || { echo "root: legacy rule requires manual review" >&2; exit 1; }
+  oldrule="$(cat "$VPN_SUDOERS")"
+  numeric="#${VPN_UID} ALL=(root) NOPASSWD: ${VPN_LEGACY_PRIV}"
+  named="${VPN_LOGIN} ALL=(root) NOPASSWD: ${VPN_LEGACY_PRIV}"
+  [ "$oldrule" = "$numeric" ] || [ "$oldrule" = "$named" ] || { echo "root: custom legacy sudoers file kept; review it manually before migration" >&2; exit 1; }
+  rm -f -- "$VPN_SUDOERS" || exit 1
+  echo "Revoked legacy passwordless rule: $VPN_SUDOERS"
+  # Never restore a passwordless grant if a later installation step fails.
 fi
 
 # Publication, one destination at a time. Before overwriting, the old
 # content is kept so an interrupted run can be undone; a destination that
 # is not a plain file is refused rather than replaced.
-undo=()
+undo_src=(); undo_dst=(); undo_mode=(); undo_kind=()
 restore() {
-  local i
-  for ((i=${#undo[@]}-1; i>=0; i--)); do
-    set -- ${undo[i]}
-    case "$1" in
-      keep) install -m "$4" -o root -g root "$2" "$3" 2>/dev/null || true ;;
-      drop) rm -f "$3" 2>/dev/null || true ;;
-    esac
+  local i failed=0 tmp
+  for ((i=${#undo_dst[@]}-1; i>=0; i--)); do
+    if [ "${undo_kind[i]}" = keep ]; then
+      tmp="${undo_dst[i]}.restore.$$"
+      scratch+=("$tmp")
+      if ! install -m "${undo_mode[i]}" -o root -g root "${undo_src[i]}" "$tmp" || ! mv -Tf -- "$tmp" "${undo_dst[i]}"; then
+        echo "ROLLBACK FAILED: ${undo_dst[i]}" >&2; failed=1
+      fi
+    else
+      rm -f -- "${undo_dst[i]}" || { echo "ROLLBACK FAILED: ${undo_dst[i]}" >&2; failed=1; }
+    fi
   done
+  return "$failed"
 }
 publish() {
   local src="$1" dst="$2" mode="$3" n oldmode
-  n="${dst##*/}"
+  n="${#undo_dst[@]}"
   if [ -e "$dst" ] || [ -L "$dst" ]; then
     # A destination that is not a plain file is refused, not replaced: a
     # symlink there would send the write somewhere else entirely.
     [ -f "$dst" ] && [ ! -L "$dst" ] || { echo "root: $dst is not a plain file" >&2; return 1; }
-    if cmp -s "$src" "$dst"; then echo "already current: $dst"; return 0; fi
+    if cmp -s "$src" "$dst" && [ "$(stat -c "%u:%g:%a" "$dst")" = "0:0:$mode" ]; then echo "already current: $dst"; return 0; fi
     oldmode="$(stat -c %a "$dst" 2>/dev/null)" || return 1
     cat "$dst" >"$stage/backup.$n" || return 1
-    undo+=("keep $stage/backup.$n $dst ${oldmode:-$mode}")
+    undo_kind+=(keep); undo_src+=("$stage/backup.$n"); undo_dst+=("$dst"); undo_mode+=("${oldmode:-$mode}")
   else
-    undo+=("drop - $dst -")
+    undo_kind+=(drop); undo_src+=(""); undo_dst+=("$dst"); undo_mode+=("$mode")
   fi
   echo "installing $dst"
   # Written beside the destination and moved onto it: a reader sees either
   # the old file or the new one, never half of either.
+  scratch+=("$dst.new.$$")
   install -m "$mode" -o root -g root "$src" "$dst.new.$$" || return 1
-  mv -f "$dst.new.$$" "$dst" || { rm -f "$dst.new.$$"; return 1; }
+  mv -Tf -- "$dst.new.$$" "$dst" || return 1
 }
 
-# Grant last: the program has to be in place before the rule that points at
-# it. The other way round leaves a rule pointing at nothing -- and sudo does
-# not treat a rule whose program it cannot resolve as matching, so a missing
-# program presents itself as a missing permission.
-publish "$stage/omarchy-vpn-privileged"   "$VPN_PRIV"   755 || { restore; exit 1; }
-publish "$stage/omarchy-vpn-import"       "$VPN_IMPORT" 755 || { restore; exit 1; }
-publish "$stage/omarchy-vpn-import.policy" "$VPN_POLICY" 644 || { restore; exit 1; }
-publish "$stage/sudoers"                  "$VPN_SUDOERS" 440 || { restore; exit 1; }
-' || { say "FAILED: the privileged step did not complete -- nothing was left half done."; exit 1; }
+# Helpers first, then their authenticated Polkit actions. No new sudoers grant.
+publish "$stage/omarchy-vpn-privileged"   "$VPN_PRIV"   755 || exit 1
+publish "$stage/omarchy-vpn-import"       "$VPN_IMPORT" 755 || exit 1
+publish "$stage/omarchy-vpn-import.policy" "$VPN_POLICY" 644 || exit 1
+publish "$stage/omarchy-vpn-switch.policy" "$VPN_SWITCH_POLICY" 644 || exit 1
+committed=true
+' || { say "FAILED: system installation did not complete. A revoked legacy grant is intentionally NOT restored; rerun after resolving the error."; exit 1; }
 
 say "System part done. If the widget is running: omarchy-restart-shell"

@@ -1,93 +1,50 @@
 #!/usr/bin/env bash
-# Without --system deliberately almost a no-op. Neither the connection list
-# nor the sudoers entries nor the systemd units are touched -- they belong
-# to the system, not to this plugin.
+# Remove only plugin system artefacts, never VPN files, list or running units.
 set -uo pipefail
-
 SYSTEM=false
 for arg in "$@"; do
-  case "$arg" in
-    --system) SYSTEM=true ;;
-    *) printf 'Usage: %s [--system]\n' "$0" >&2; exit 64 ;;
-  esac
+  case "$arg" in --system) SYSTEM=true ;; *) echo "Usage: $0 [--system]" >&2; exit 64 ;; esac
 done
-
 CONF="${OMARCHY_VPN_CONNECTIONS:-$HOME/.config/omarchy/vpn-connections.json}"
-PRIV="${OMARCHY_VPN_PRIVILEGED:-/usr/local/bin/omarchy-vpn-privileged}"
+PRIV="${OMARCHY_VPN_PRIVILEGED:-/usr/local/bin/omarchy-vpn-switch}"
 IMPORT="${OMARCHY_VPN_IMPORT:-/usr/local/bin/omarchy-vpn-import}"
 POLICY="${OMARCHY_VPN_POLICY:-/usr/share/polkit-1/actions/org.omarchy.smartalbvpn.import.policy}"
+SWITCH_POLICY="${OMARCHY_VPN_SWITCH_POLICY:-/usr/share/polkit-1/actions/org.omarchy.smartalbvpn.switch.policy}"
 SUDOERS="${OMARCHY_VPN_SUDOERS:-/etc/sudoers.d/smartalb-vpn}"
-
+LEGACY_PRIV="${OMARCHY_VPN_LEGACY_PRIVILEGED:-/usr/local/bin/omarchy-vpn-privileged}"
 if [ "$SYSTEM" = false ]; then
-cat <<EOF2
-Nothing to do. The connection list is kept:
-  $CONF
-
-Not removed, because they live outside this plugin:
-  $PRIV
-  $IMPORT
-  $POLICY
-  $SUDOERS
-  /etc/openvpn/client/*.conf and /etc/wireguard/*.conf
-Running connections keep running.
-
-'./uninstall --system' removes the first four, and only those.
-
-Configurations created through the widget likewise stay behind in /etc.
-Whoever wants to be rid of them removes them through the widget itself
-before uninstalling (with 'also delete the file' ticked).
-
-The entry { "id": "smartalb.vpn" } under bar.layout.right in
-~/.config/omarchy/shell.json is removed by 'omarchy plugin remove
-smartalb.vpn'. After a manual installation, take it out by hand -- otherwise
-the bar keeps trying to load a plugin that is no longer there.
-EOF2
-exit 0
+  echo "Nothing to do. The connection list is kept: $CONF"
+  echo "Use ./uninstall --system to remove the two helpers and two Polkit policies."
+  echo "An exact legacy sudoers grant for this user is also revoked, if present."
+  echo "VPN configurations and running connections keep running unchanged."
+  exit 0
 fi
-
-# ----------------------------------------------------------- --system
-#
-# The four privileged artefacts, and nothing else. Not the connection list,
-# not the configurations in /etc, not running tunnels -- see the text above.
-gone=true
-
-drop() {
-  local path="$1" what="$2"
-  if [ ! -e "$path" ]; then
-    echo "not there: $path"
-    return 0
+[ "$(id -u)" != 0 ] || { echo 'Run as your normal user, not root.' >&2; exit 1; }
+sudo env VPN_UID="$(id -u)" VPN_LOGIN="$(id -un)" VPN_PRIV="$PRIV" VPN_IMPORT="$IMPORT" \
+  VPN_POLICY="$POLICY" VPN_SWITCH_POLICY="$SWITCH_POLICY" VPN_SUDOERS="$SUDOERS" VPN_LEGACY_PRIV="$LEGACY_PRIV" bash -p -c '
+set -euo pipefail
+for v in VPN_PRIV VPN_IMPORT VPN_POLICY VPN_SWITCH_POLICY VPN_SUDOERS VPN_LEGACY_PRIV; do
+  case "${!v}" in /*) ;; *) echo "Non-absolute path refused: $v" >&2; exit 1 ;; esac
+done
+# Check all artefacts before deleting any, including dangling symlinks.
+for path in "$VPN_PRIV" "$VPN_IMPORT" "$VPN_POLICY" "$VPN_SWITCH_POLICY" "$VPN_SUDOERS"; do
+  if [ -e "$path" ] || [ -L "$path" ]; then
+    [ -f "$path" ] && [ ! -L "$path" ] || { echo "Not a plain file, kept: $path" >&2; exit 1; }
   fi
-  gone=false
-  echo "removing $what: $path"
-  sudo rm -f "$path" || { echo "FAILED: could not remove $path" >&2; exit 1; }
-}
-
-# The sudoers rule goes FIRST -- the mirror of the order in 'install
-# --system', and for the same reason. Taking the program away first would
-# leave a rule pointing at nothing, and sudo does not treat a rule whose
-# program it cannot resolve as matching, so the missing program presents
-# itself as a missing permission. An interrupted run must not stop in that
-# state.
-if [ ! -e "$SUDOERS" ]; then
-  echo "not there: $SUDOERS"
-elif ! sudo grep -q "omarchy-vpn-privileged" "$SUDOERS" 2>/dev/null; then
-  # A file we did not write is none of our business. Without this check a
-  # mis-set path -- or a file somebody extended by hand -- would take other
-  # rules down with it.
-  echo "kept, not written by this plugin: $SUDOERS" >&2
-else
-  gone=false
-  echo "removing the sudoers rule: $SUDOERS"
-  sudo rm -f "$SUDOERS" || { echo "FAILED: could not remove $SUDOERS" >&2; exit 1; }
+done
+if [ -f "$VPN_SUDOERS" ]; then
+  [ "$(stat -c %s "$VPN_SUDOERS")" -le 1024 ] || { echo "Legacy rule requires manual review" >&2; exit 1; }
+  oldrule="$(cat "$VPN_SUDOERS")"
+  numeric="#${VPN_UID} ALL=(root) NOPASSWD: ${VPN_LEGACY_PRIV}"
+  named="${VPN_LOGIN} ALL=(root) NOPASSWD: ${VPN_LEGACY_PRIV}"
+  [ "$oldrule" = "$numeric" ] || [ "$oldrule" = "$named" ] || { echo "Custom legacy sudoers file kept; manual review required" >&2; exit 1; }
+  rm -f -- "$VPN_SUDOERS"
 fi
-
-drop "$PRIV"   "the switching program"
-drop "$IMPORT" "the import program"
-drop "$POLICY" "the polkit action"
-
-if [ "$gone" = true ]; then
-  echo "Nothing was there to remove."
-else
-  echo "Done. The connection list, the configurations in /etc and running"
-  echo "tunnels are untouched."
-fi
+# Policies first; the legacy helper is left inert rather than deleting an
+# independently modified executable whose provenance we cannot establish.
+rm -f -- "$VPN_SWITCH_POLICY" "$VPN_POLICY"
+rm -f -- "$VPN_PRIV" "$VPN_IMPORT"
+'
+rc=$?
+[ "$rc" -eq 0 ] && echo 'Done. Connection list, VPN configurations and running tunnels are untouched.'
+exit "$rc"

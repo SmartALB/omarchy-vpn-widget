@@ -1,70 +1,66 @@
 #!/bin/bash -p
-# Switches exactly one VPN unit -- and nothing else.
-#
-# This program is the only piece of the plugin that runs as root. The
-# matching sudoers rule reads
-#
-#   <user> ALL=(root) NOPASSWD: /usr/local/bin/omarchy-vpn-privileged
-#
-# that is, WITHOUT any restriction on the arguments. The checks further
-# down are therefore the entire gate. Deliberately this way round: a check
-# written in code can be tested, a regular expression in sudoers cannot.
-#
-# TWO RULES that apply when changing this:
-#
-#   1. Read nothing from the environment. No ${VAR:-...}, no path taken
-#      from a variable. Everything that comes in from outside is an
-#      opportunity to make this program do something else -- as root. That
-#      is why the test suite runs a copy in which the SYSTEMCTL line below
-#      is textually replaced; see test/run-tests.sh, setup_sandbox().
-#      This expressly covers line 1 as well: "#!/usr/bin/env bash" would
-#      have the kernel start /usr/bin/env, and env looks for bash in the
-#      PATH -- the PATH of the calling user, which sudo passes through
-#      unchanged unless "Defaults secure_path" is set. Hence the fixed
-#      "#!/bin/bash -p": no PATH lookup, and "-p" (privileged mode)
-#      additionally ignores BASH_ENV, SHELLOPTS and inherited shell
-#      functions in case env_reset is switched off on the target system.
-#
-#   2. This file must not live anywhere the user can write to it. It is
-#      installed into /usr/local/bin/, root:root, 755; only that path is
-#      named in sudoers. A NOPASSWD rule pointing at a user-writable file
-#      would be a root shell.
-#
-# Usage: omarchy-vpn-privileged <start|stop> <unit>
+# Installed as /usr/local/bin/omarchy-vpn-switch, root:root 0755.
+# Every call goes through pkexec/auth_admin; there is no sudoers grant.
+# A switch validates the complete unit set before making any changes, then
+# stops group peers and starts the target inside ONE authorized operation.
 set -uo pipefail
-
+export PATH=/usr/bin:/bin LC_ALL=C
 ME="${0##*/}"
-
-# Hard-wired, not redirectable -- see rule 1 above. The exact spelling of
-# this line is a contract: test/run-tests.sh replaces precisely it.
 SYSTEMCTL=/usr/bin/systemctl
+TIMEOUT=/usr/bin/timeout
+LOCK=/run/omarchy-vpn-switch.lock
+MAX_SECONDS=90
 
-if [ $# -ne 2 ]; then
-  printf '%s: expected exactly two arguments: <start|stop> <unit>\n' "$ME" >&2
-  exit 64
+fail() { printf '%s: %s\n' "$ME" "$2" >&2; exit "$1"; }
+[ "$#" -ge 2 ] && [ "$#" -le 201 ] || fail 64 'expected <start|stop|switch> <unit> [group peers...]'
+action="$1"; shift
+case "$action" in start|stop) [ "$#" -eq 1 ] || fail 64 'start/stop accepts one unit' ;; switch) ;; *) fail 65 "disallowed action: ${action:0:80}" ;; esac
+
+units=()
+declare -A seen=()
+for unit in "$@"; do
+  unit="${unit%.service}"
+  [[ "$unit" =~ ^(openvpn-client|wg-quick)@[A-Za-z0-9_.-]+$ ]] && [ "${#unit}" -le 240 ] || fail 66 "disallowed unit name: ${unit:0:80}"
+  [ -z "${seen[$unit]:-}" ] || fail 66 'duplicate unit in request'
+  seen[$unit]=1
+  units+=("$unit")
+done
+
+# /run is root-owned; never use a user-controlled directory for this lock.
+[ ! -L "$LOCK" ] || fail 1 'lock path is a symlink'
+umask 077
+exec 9>"$LOCK" || fail 1 'cannot open operation lock'
+/usr/bin/flock -n 9 || fail 1 'another VPN operation is in progress'
+SECONDS=0
+run() {
+  local remaining=$((MAX_SECONDS - SECONDS)) rc
+  [ "$remaining" -gt 0 ] || fail 124 'VPN operation timed out; systemd jobs may still be running'
+  "$TIMEOUT" -k 2 "$remaining" "$SYSTEMCTL" "$@"
+  rc=$?
+  [ "$rc" -ne 124 ] && [ "$rc" -ne 137 ] || fail 124 'VPN operation timed out; systemd jobs may still be running'
+  [ "$rc" -ne 126 ] && [ "$rc" -ne 127 ] || fail 1 'could not execute systemctl'
+  return "$rc"
+}
+state() {
+  local result rc
+  result="$(run is-active -- "$1.service")"; rc=$?
+  [ "$rc" -ne 124 ] || fail 124 'VPN status query timed out'
+  case "$result" in active|inactive|failed|activating|deactivating|reloading) printf '%s' "$result" ;;
+    *) fail 1 'cannot determine VPN service state' ;;
+  esac
+}
+target="${units[0]}"
+if [ "$action" != switch ]; then
+  run "$action" -- "$target.service"
+  exit $?
 fi
-
-action="$1"
-unit="$2"
-
-case "$action" in
-  start|stop) ;;
-  *)
-    printf '%s: disallowed action: %s (allowed: start, stop)\n' "$ME" "$action" >&2
-    exit 65 ;;
+current="$(state "$target")" || exit $?
+case "$current" in
+  active|activating|reloading|deactivating) run stop -- "$target.service"; exit $? ;;
 esac
-
-# A full match, not merely a prefix. Ruled out by it: foreign units, an
-# empty instance name, '/', spaces, newlines, ';' and every other piece of
-# punctuation, as well as options such as '--now' (they do not carry the
-# required prefix). A trailing '.service' is allowed: instance names may
-# contain dots, and 'wg-quick@x.service' names the same unit as
-# 'wg-quick@x'.
-if ! [[ "$unit" =~ ^(openvpn-client|wg-quick)@[A-Za-z0-9_.-]+$ ]]; then
-  printf '%s: disallowed unit name: %s\n' "$ME" "$unit" >&2
-  exit 66
-fi
-
-# exec, not a call: after the check this program has nothing left to do,
-# and systemctl's exit code reaches the caller unchanged.
-exec "$SYSTEMCTL" "$action" "$unit"
+for peer in "${units[@]:1}"; do
+  current="$(state "$peer")" || exit $?
+  case "$current" in inactive|failed) continue ;; esac
+  run stop -- "$peer.service" || exit $?
+done
+run start -- "$target.service"
