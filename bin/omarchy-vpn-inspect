@@ -63,11 +63,10 @@ fi
 # the file the very same way -- what is judged and what is written have to be
 # the same bytes.
 #
-# The .sha256 field below belongs to exactly that promise. The workflow
-# (bin/omarchy-vpn-add) no longer USES it -- it once secured a second read of
-# the clipboard, and that read is gone. It stays as evidence: a test holds it
-# against the file omarchy-vpn-import actually wrote, and turns red the
-# moment one of the two normalizations drifts away from the other.
+# The .sha256 field below belongs to exactly that promise. The panel passes it
+# to bin/omarchy-vpn-add, which rejects a file changed after the preview.
+# Tests also hold it against the file omarchy-vpn-import actually wrote and
+# turn red the moment one of the two normalizations drifts apart.
 normalized="$(printf '%s\n' "$content")"
 
 # Determines the kind -- and does so BLOCK-AWARE, exactly like check_openvpn
@@ -134,8 +133,8 @@ detect_kind() {
       case "${BASH_REMATCH[1]}" in connection) ;; *) inblock="${BASH_REMATCH[1]}" ;; esac
       continue
     fi
-    case "$line" in
-      *"[Interface]"*) printf 'wireguard'; return 0 ;;
+    case "$trimmed" in
+      "[Interface]") printf 'wireguard'; return 0 ;;
     esac
     if [ -z "$ovpn" ]; then
       case "$line" in
@@ -465,18 +464,71 @@ check_openvpn() {
 }
 
 check_wireguard() {
-  local n=0 line word
+  local n=0 line key value lower section="" seen_interface=false
+  local seen_private=false seen_peer=false peer_public=false
   while IFS= read -r line; do
     n=$((n + 1))
     line="${line#"${line%%[![:space:]]*}"}"
-    case "$line" in ""|"#"*) continue ;; esac
-    word="${line%%[[:space:]=]*}"
-    case "$(printf '%s' "$word" | tr 'A-Z' 'a-z')" in
-      postup|preup|postdown|predown)
-        violation="Directive executes code as root: $(trunc "$word")"
+    line="${line%"${line##*[![:space:]]}"}"
+    case "$line" in ""|"#"*|";"*) continue ;; esac
+    case "$line" in
+      "[Interface]")
+        [ "$seen_interface" = false ] || {
+          violation="Duplicate [Interface] section"; violation_line="$n"; return; }
+        section=interface; seen_interface=true; continue ;;
+      "[Peer]")
+        [ "$seen_interface" = true ] || {
+          violation="[Peer] appears before [Interface]"; violation_line="$n"; return; }
+        if [ "$seen_peer" = true ] && [ "$peer_public" = false ]; then
+          violation="Peer section has no PublicKey"; violation_line="$n"; return
+        fi
+        section=peer; seen_peer=true; peer_public=false; continue ;;
+      "["*"]")
+        violation="Unknown WireGuard section: $(trunc "$line")"
         violation_line="$n"; return ;;
     esac
+    [ -n "$section" ] || {
+      violation="WireGuard setting appears before [Interface]"; violation_line="$n"; return; }
+    case "$line" in
+      *=*) key="${line%%=*}"; key="${key%"${key##*[![:space:]]}"}" ;;
+      *) violation="Expected WireGuard key = value"; violation_line="$n"; return ;;
+    esac
+    value="${line#*=}"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    [ -n "$value" ] || {
+      violation="WireGuard setting has an empty value: $(trunc "$key")"
+      violation_line="$n"; return; }
+    lower="$(printf '%s' "$key" | tr 'A-Z' 'a-z')"
+    case "$lower" in
+      postup|preup|postdown|predown)
+        violation="Directive executes code as root: $(trunc "$key")"
+        violation_line="$n"; return ;;
+    esac
+    if [ "$section" = interface ]; then
+      case "$key" in
+        PrivateKey) seen_private=true ;;
+        Address|DNS|MTU|Table|SaveConfig|ListenPort|FwMark) ;;
+        *) violation="Unsupported WireGuard interface setting: $(trunc "$key")"
+           violation_line="$n"; return ;;
+      esac
+    else
+      case "$key" in
+        PublicKey) peer_public=true ;;
+        PresharedKey|AllowedIPs|Endpoint|PersistentKeepalive) ;;
+        *) violation="Unsupported WireGuard peer setting: $(trunc "$key")"
+           violation_line="$n"; return ;;
+      esac
+    fi
   done <<<"$1"
+  [ "$seen_interface" = true ] || {
+    violation="No [Interface] section"; violation_line="$n"; return; }
+  [ "$seen_private" = true ] || {
+    violation="Interface section has no PrivateKey"; violation_line="$n"; return; }
+  [ "$seen_peer" = true ] || {
+    violation="Configuration has no [Peer] section"; violation_line="$n"; return; }
+  [ "$peer_public" = true ] || {
+    violation="Peer section has no PublicKey"; violation_line="$n"; return; }
 }
 
 if [ "$kind" = "openvpn" ]; then check_openvpn "$normalized"; else check_wireguard "$normalized"; fi

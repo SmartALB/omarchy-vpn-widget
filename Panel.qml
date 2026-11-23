@@ -60,7 +60,7 @@ Panel {
     return root.runner("{ " + cmd + " ; } 2> >(head -c " + root.maxOutBytes + " >&2)")
   }
 
-  readonly property string pluginVersion: "2.0.0"
+  readonly property string pluginVersion: "2.1.0"
 
   property var connections: []
   property string loadError: ""
@@ -71,6 +71,7 @@ Panel {
   property string addError: ""
   property string addKind: ""       // "openvpn" | "wireguard" | ""
   property string addRemote: ""
+  property string addSha: ""
   // The path of the chosen file. Not a secret (unlike its content), so it
   // is shown.
   property string addPath: ""
@@ -79,6 +80,9 @@ Panel {
   property string addLabel: ""
   property string addGroup: ""
   property bool addBusy: false
+  property int inspectGeneration: 0
+  property int inspectRequestGeneration: 0
+  property string inspectRequestPath: ""
   // True while the file list is expanded. It is NOT a window of its own
   // (the reason is in the header comment of folderModel) but part of this
   // panel -- so the flag belongs to the draft state of the add section and
@@ -117,14 +121,14 @@ Panel {
   // the verdict and the label), yet it too is discarded as soon as the
   // section is closed.
   function resetAddSection() {
+    root.inspectGeneration++
     root.addKind = ""; root.addLabel = ""; root.addGroup = ""
-    root.addPath = ""; root.addRemote = ""; root.addError = ""
+    root.addPath = ""; root.addRemote = ""; root.addSha = ""; root.addError = ""
     // The file list collapses with it. root.browseDir deliberately stays
     // where it is, see there.
     root.addBrowsing = false
-    // See the comment at labelField: text: root.addLabel binds only once,
-    // after the first keystroke the field has to be cleared by hand.
-    labelField.text = ""; groupField.text = ""
+    // Clearing addKind destroys both input loaders, so no hidden text
+    // controls remain alive and no imperative text reset is needed.
   }
 
   // Discards a row's confirmation prompt -- shared by the Cancel button,
@@ -138,16 +142,27 @@ Panel {
   // The script is authoritative; if the two ever differ, what the script
   // does is what counts.
   function derivedName(label, kind) {
-    var s = String(label || "").replace(/[^A-Za-z0-9_.\-]/g, "_")
+    var s = String(label || "").replace(/[^A-Za-z0-9_.\-]/gu, "_")
     s = s.replace(/^-+/, "")
     if (s === "." || s === "..") s = ""
-    return s.substring(0, kind === "wireguard" ? 15 : 64)
+    return Array.from(s).slice(0, kind === "wireguard" ? 15 : 64).join("")
+  }
+
+  function labelIsValid(label, kind) {
+    var raw = String(label || "")
+    var maxlen = kind === "wireguard" ? 15 : 64
+    if (!/[A-Za-z0-9_.-]/.test(raw)) return false
+    var withoutDashes = raw.replace(/^-+/, "")
+    if (!/[A-Za-z0-9_.-]/.test(Array.from(withoutDashes).slice(0, maxlen).join(""))) return false
+    var name = derivedName(raw, kind)
+    return name !== "" && name !== "." && name !== ".."
   }
 
   readonly property string addName: derivedName(root.addLabel, root.addKind)
   readonly property string addUnit: root.addKind === "wireguard"
     ? "wg-quick@" + root.addName
     : "openvpn-client@" + root.addName
+  readonly property bool addLabelValid: labelIsValid(root.addLabel, root.addKind)
 
   // Nerd Font glyphs as escapes, not as literal characters: the code
   // points sit in the Unicode private use area and do not reliably survive
@@ -265,6 +280,10 @@ Panel {
     root.addBusy = true
     root.addError = ""
     root.addKind = ""
+    root.addSha = ""
+    root.inspectGeneration++
+    root.inspectRequestGeneration = root.inspectGeneration
+    root.inspectRequestPath = path
     inspectProc.command = root.runnerOut(
       "cat -- " + root.shellEscape(path) + " 2>/dev/null | "
       + root.scriptDir + "/omarchy-vpn-inspect")
@@ -275,7 +294,8 @@ Panel {
     if (root.addBusy) return
     if (root.addPath === "") { root.addError = "Pick a configuration file first"; return }
     if (root.addKind === "") { root.addError = "The chosen file was not accepted"; return }
-    if (root.addName === "") { root.addError = "Label yields no valid name"; return }
+    if (!root.addLabelValid) { root.addError = "Label yields no valid name"; return }
+    if (!/^[0-9a-f]{64}$/.test(root.addSha)) { root.addError = "Preview fingerprint is missing; choose the file again"; return }
     root.addBusy = true
     root.addError = ""
     root.manageAction = "add"
@@ -285,7 +305,8 @@ Panel {
     manageProc.command = root.runnerErr(
       root.scriptDir + "/omarchy-vpn-add " + root.shellEscape(root.addPath)
       + " " + root.shellEscape(root.addLabel)
-      + (root.addGroup !== "" ? " " + root.shellEscape(root.addGroup) : ""))
+      + " " + root.shellEscape(root.addGroup)
+      + " " + root.shellEscape(root.addSha))
     manageProc.running = true
   }
 
@@ -355,7 +376,7 @@ Panel {
   FolderListModel {
     id: folderModel
     folder: root.pathToUrl(root.browseDir)
-    nameFilters: ["*.ovpn", "*.conf"]
+    nameFilters: ["*.ovpn", "*.OVPN", "*.conf", "*.CONF"]
     showDirs: true
     showDirsFirst: true
     showFiles: true
@@ -448,6 +469,8 @@ Panel {
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
+        if (root.inspectRequestGeneration !== root.inspectGeneration
+            || root.inspectRequestPath !== root.addPath) return
         var raw = String(text || "").trim()
         if (raw === "") {
           root.addKind = ""
@@ -459,6 +482,7 @@ Panel {
           if (d.ok) {
             root.addKind = String(d.kind || "")
             root.addRemote = String(d.remote || "")
+            root.addSha = String(d.sha256 || "")
             root.addBytes = Number(d.bytes || 0)
             root.addEmbedded = d.embedded === true
             root.addError = ""
@@ -581,6 +605,7 @@ Panel {
       Text {
         width: panelColumn.width
         visible: root.loadError !== ""
+        textFormat: Text.PlainText
         text: root.loadError
         color: root.fg
         font.family: root.fontFam
@@ -591,6 +616,7 @@ Panel {
       Text {
         width: panelColumn.width
         visible: root.loadError === "" && root.connections.length === 0
+        textFormat: Text.PlainText
         text: "No connections registered. See ~/.config/omarchy/vpn-connections.json"
         color: root.fg
         opacity: 0.7
@@ -610,6 +636,7 @@ Panel {
       Text {
         width: panelColumn.width
         visible: root.removeError !== "" && root.removeId === ""
+        textFormat: Text.PlainText
         text: "Remove (background): " + root.removeError
         color: root.fg
         font.family: root.fontFam
@@ -629,6 +656,7 @@ Panel {
       Text {
         width: panelColumn.width
         visible: root.addError !== "" && !root.addOpen
+        textFormat: Text.PlainText
         text: "Add (background): " + root.addError
         color: root.fg
         font.family: root.fontFam
@@ -637,19 +665,34 @@ Panel {
       }
 
       Repeater {
+        id: connectionRepeater
         model: root.connections
 
         Rectangle {
+          required property int index
           required property var modelData
 
           width: panelColumn.width
+          activeFocusOnTab: true
+          Accessible.role: Accessible.Button
+          Accessible.name: "Toggle VPN connection " + String(modelData.label || "")
           // outerColumn automatically leaves root.removeId === modelData.id
           // (the invisible confirmation block) out of the height -- a Column
           // does not count invisible children.
           implicitHeight: outerColumn.implicitHeight + Style.spacing.sm * 2
           radius: Style.cornerRadius
-          color: (rowMouse.containsMouse && !toggleProc.running) ? Style.hoverFill : "transparent"
+          color: ((rowMouse.containsMouse || activeFocus) && !toggleProc.running) ? Style.hoverFill : "transparent"
           opacity: toggleProc.running ? 0.45 : 1.0
+          Keys.onReturnPressed: root.toggleConnection(modelData.id)
+          Keys.onSpacePressed: root.toggleConnection(modelData.id)
+          Keys.onUpPressed: {
+            var previous = connectionRepeater.itemAt(Math.max(0, index - 1))
+            if (previous) previous.forceActiveFocus()
+          }
+          Keys.onDownPressed: {
+            var next = connectionRepeater.itemAt(Math.min(connectionRepeater.count - 1, index + 1))
+            if (next) next.forceActiveFocus()
+          }
 
           Column {
             id: outerColumn
@@ -682,6 +725,7 @@ Panel {
 
                 Text {
                   width: parent.width
+                  textFormat: Text.PlainText
                   text: (modelData.state === "active" ? "\u25CF  " : "") + modelData.label
                   color: root.fg
                   font.family: root.fontFam
@@ -691,6 +735,7 @@ Panel {
 
                 Text {
                   width: parent.width
+                  textFormat: Text.PlainText
                   text: modelData.state === "active" ? "connected"
                         : modelData.state === "failed" ? "failed -- journalctl -u " + modelData.unit
                         : "disconnected"
@@ -813,6 +858,7 @@ Panel {
               Text {
                 width: parent.width
                 visible: root.removeError !== ""
+                textFormat: Text.PlainText
                 text: root.removeError
                 color: root.fg
                 font.family: root.fontFam
@@ -827,6 +873,7 @@ Panel {
       Text {
         width: panelColumn.width
         visible: toggleProc.running
+        textFormat: Text.PlainText
         text: "Switching ..."
         color: root.fg
         opacity: 0.7
@@ -842,6 +889,7 @@ Panel {
       Text {
         width: panelColumn.width
         visible: root.toggleError !== ""
+        textFormat: Text.PlainText
         text: root.toggleError
         color: root.fg
         font.family: root.fontFam
@@ -989,6 +1037,7 @@ Panel {
           // rarely does.
           Text {
             width: browseColumn.width
+            textFormat: Text.PlainText
             text: "Folder: " + root.browseDir
             color: root.fg
             opacity: 0.7
@@ -1002,11 +1051,23 @@ Panel {
           // way the way out stays visible even when the folder is empty or
           // unreadable.
           Rectangle {
+            id: upEntry
             visible: root.parentDir(root.browseDir) !== ""
             width: browseColumn.width
             height: Style.spacing.popupRowHeight
+            activeFocusOnTab: visible
+            Accessible.role: Accessible.Button
+            Accessible.name: "One directory level up"
             radius: Style.cornerRadius
-            color: upMouse.containsMouse ? Style.hoverFill : "transparent"
+            color: (upMouse.containsMouse || activeFocus) ? Style.hoverFill : "transparent"
+            Keys.onReturnPressed: root.browseDir = root.parentDir(root.browseDir)
+            Keys.onSpacePressed: root.browseDir = root.parentDir(root.browseDir)
+            Keys.onDownPressed: {
+              if (fileList.count > 0) {
+                fileList.currentIndex = 0
+                if (fileList.currentItem) fileList.currentItem.forceActiveFocus()
+              }
+            }
 
             Text {
               anchors.left: parent.left
@@ -1014,6 +1075,7 @@ Panel {
               anchors.leftMargin: Style.spacing.sm
               anchors.rightMargin: Style.spacing.sm
               anchors.verticalCenter: parent.verticalCenter
+              textFormat: Text.PlainText
               text: root.glyphUp + "  One level up"
               color: root.fg
               font.family: root.fontFam
@@ -1048,6 +1110,7 @@ Panel {
 
             delegate: Rectangle {
               id: entry
+              required property int index
               // The roles of FolderListModel as named properties.
               // "required" resolves them unambiguously in the delegate;
               // filePath is a finished filesystem path, exactly what
@@ -1058,8 +1121,33 @@ Panel {
 
               width: fileList.width
               height: Style.spacing.popupRowHeight
+              activeFocusOnTab: true
+              Accessible.role: Accessible.Button
+              Accessible.name: (entry.fileIsDir ? "Open folder " : "Choose file ") + entry.fileName
               radius: Style.cornerRadius
-              color: entryMouse.containsMouse ? Style.hoverFill : "transparent"
+              color: (entryMouse.containsMouse || activeFocus) ? Style.hoverFill : "transparent"
+              onActiveFocusChanged: {
+                if (activeFocus) fileList.currentIndex = index
+              }
+              Keys.onReturnPressed: {
+                if (entry.fileIsDir) root.browseDir = entry.filePath
+                else root.pickFile(entry.filePath)
+              }
+              Keys.onSpacePressed: {
+                if (entry.fileIsDir) root.browseDir = entry.filePath
+                else root.pickFile(entry.filePath)
+              }
+              Keys.onUpPressed: {
+                if (index === 0 && upEntry.visible) upEntry.forceActiveFocus()
+                else {
+                  fileList.currentIndex = Math.max(0, index - 1)
+                  if (fileList.currentItem) fileList.currentItem.forceActiveFocus()
+                }
+              }
+              Keys.onDownPressed: {
+                fileList.currentIndex = Math.min(fileList.count - 1, index + 1)
+                if (fileList.currentItem) fileList.currentItem.forceActiveFocus()
+              }
 
               Text {
                 anchors.left: parent.left
@@ -1067,6 +1155,7 @@ Panel {
                 anchors.leftMargin: Style.spacing.sm
                 anchors.rightMargin: Style.spacing.sm
                 anchors.verticalCenter: parent.verticalCenter
+                textFormat: Text.PlainText
                 text: (entry.fileIsDir ? root.glyphFolder : root.glyphFile) + "  " + entry.fileName
                 color: root.fg
                 font.family: root.fontFam
@@ -1091,6 +1180,7 @@ Panel {
           Text {
             width: browseColumn.width
             visible: folderModel.status === FolderListModel.Loading
+            textFormat: Text.PlainText
             text: "Reading ..."
             color: root.fg
             opacity: 0.7
@@ -1105,6 +1195,7 @@ Panel {
           Text {
             width: browseColumn.width
             visible: folderModel.count === 0 && folderModel.status !== FolderListModel.Loading
+            textFormat: Text.PlainText
             text: "There is nothing to pick here -- neither a subfolder nor an *.ovpn or *.conf file. It is also possible that the folder is not readable."
             color: root.fg
             opacity: 0.7
@@ -1126,6 +1217,7 @@ Panel {
         Text {
           width: addColumn.width
           visible: root.addPath !== "" && root.addKind === ""
+          textFormat: Text.PlainText
           text: "File: " + root.addPath
           color: root.fg
           opacity: 0.7
@@ -1140,6 +1232,7 @@ Panel {
         Text {
           width: addColumn.width
           visible: root.addKind !== ""
+          textFormat: Text.PlainText
           text: "Kind: " + (root.addKind === "wireguard" ? "WireGuard" : "OpenVPN")
                 + "\nRemote: " + root.addRemote
                 + (root.addKind === "openvpn"
@@ -1161,24 +1254,37 @@ Panel {
         // successful create) -- otherwise the old label would still be
         // visible on the next open even though root.addLabel is already
         // "".
-        TextField {
-          id: labelField
+        Loader {
+          id: labelFieldLoader
           width: addColumn.width
-          visible: root.addKind !== ""
-          placeholderText: "Label"
-          text: root.addLabel
-          foreground: root.fg
-          onTextChanged: root.addLabel = text
+          active: root.addKind !== ""
+          sourceComponent: TextField {
+            width: labelFieldLoader.width
+            placeholderText: "Label"
+            text: root.addLabel
+            foreground: root.fg
+            onTextChanged: root.addLabel = text
+            Keys.onReturnPressed: {
+              if (root.addLabelValid && groupFieldLoader.item)
+                groupFieldLoader.item.forceActiveFocus()
+            }
+          }
         }
 
-        TextField {
-          id: groupField
+        Loader {
+          id: groupFieldLoader
           width: addColumn.width
-          visible: root.addKind !== ""
-          placeholderText: "Group (optional)"
-          text: root.addGroup
-          foreground: root.fg
-          onTextChanged: root.addGroup = text
+          active: root.addKind !== ""
+          sourceComponent: TextField {
+            width: groupFieldLoader.width
+            placeholderText: "Group (optional)"
+            text: root.addGroup
+            foreground: root.fg
+            onTextChanged: root.addGroup = text
+            Keys.onReturnPressed: {
+              if (root.addLabelValid) root.createConnection()
+            }
+          }
         }
 
         // Preview -- bin/omarchy-vpn-add is authoritative, see
@@ -1186,6 +1292,7 @@ Panel {
         Text {
           width: addColumn.width
           visible: root.addKind !== ""
+          textFormat: Text.PlainText
           text: "Unit: " + root.addUnit
           color: root.fg
           opacity: 0.7
@@ -1210,7 +1317,7 @@ Panel {
           width: addColumn.width
           visible: root.addKind !== ""
           text: root.addBusy ? "Please wait ..." : "Create"
-          enabled: !root.addBusy
+          enabled: !root.addBusy && root.addLabelValid
           opacity: createButton.enabled ? 1.0 : 0.45
           foreground: root.fg
           fontFamily: root.fontFam
@@ -1224,6 +1331,7 @@ Panel {
         Text {
           width: addColumn.width
           visible: root.addError !== ""
+          textFormat: Text.PlainText
           text: root.addError
           color: root.fg
           font.family: root.fontFam
@@ -1243,6 +1351,7 @@ Panel {
       Text {
         width: panelColumn.width
         horizontalAlignment: Text.AlignRight
+        textFormat: Text.PlainText
         text: "v" + root.pluginVersion
         color: root.fg
         opacity: 0.55

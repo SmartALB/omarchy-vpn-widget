@@ -25,6 +25,15 @@ case "$action" in
   *)      usage ;;
 esac
 
+# Lock the complete read-modify-write transaction. Atomic rename alone only
+# protects readers from partial JSON; without this lock, two writers can both
+# read the same old array and the later rename silently loses the other update.
+dir="$(dirname "$CONNECTIONS_FILE")"
+mkdir -p "$dir" || { echo "$ME: could not create $dir" >&2; exit 5; }
+LOCK_FILE="${CONNECTIONS_FILE}.lock"
+exec 9>"$LOCK_FILE" || { echo "$ME: could not open lock: $LOCK_FILE" >&2; exit 5; }
+flock 9 || { echo "$ME: could not lock: $LOCK_FILE" >&2; exit 5; }
+
 # Read the existing list. A missing file is an empty array here -- unlike in
 # read_connections(), where it means an error: there the list is being read,
 # here it is being created. A broken file remains an error in both cases; it
@@ -60,8 +69,6 @@ fi
 # Atomic: write beside it first, then rename. An interrupted write must not
 # leave half a list behind -- the panel would end up empty, and
 # omarchy-vpn-list would report "not readable".
-dir="$(dirname "$CONNECTIONS_FILE")"
-mkdir -p "$dir" || { echo "$ME: could not create $dir" >&2; exit 5; }
 tmp="$(mktemp "$dir/.vpn-connections.XXXXXX")" || { echo "$ME: no temporary file" >&2; exit 5; }
 printf '%s\n' "$updated" | jq . >"$tmp" || { rm -f "$tmp"; echo "$ME: could not write" >&2; exit 5; }
 mv -f "$tmp" "$CONNECTIONS_FILE" || { rm -f "$tmp"; echo "$ME: could not replace" >&2; exit 5; }
