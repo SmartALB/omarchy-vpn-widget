@@ -46,7 +46,8 @@ set -uo pipefail
 # brings along in the environment -- unlike the switching program
 # (omarchy-vpn-privileged), this one runs no systemctl, so nobody inherits
 # that program's message language.
-export LC_ALL=C
+export PATH=/usr/bin:/bin LC_ALL=C
+LINK=/usr/bin/ln
 
 # A deterministic file mode for everything this program creates --
 # independent of the inherited umask. mktemp is NOT umask-independent: under
@@ -433,17 +434,70 @@ check_openvpn() {
 }
 
 check_wireguard() {
-  local n=0 line word
+  local n=0 line key value lower section="" seen_interface=false
+  local seen_private=false seen_peer=false peer_public=false
   while IFS= read -r line; do
     n=$((n + 1))
     line="${line#"${line%%[![:space:]]*}"}"
-    case "$line" in ""|"#"*) continue ;; esac
-    word="${line%%[[:space:]=]*}"
-    case "$(printf '%s' "$word" | tr 'A-Z' 'a-z')" in
-      postup|preup|postdown|predown)
-        violation="Directive executes code as root: $(trunc "$word")"; violation_line="$n"; return ;;
+    line="${line%"${line##*[![:space:]]}"}"
+    case "$line" in ""|"#"*|";"*) continue ;; esac
+    case "$line" in
+      "[Interface]")
+        [ "$seen_interface" = false ] || {
+          violation="Duplicate [Interface] section"; violation_line="$n"; return; }
+        section=interface; seen_interface=true; continue ;;
+      "[Peer]")
+        [ "$seen_interface" = true ] || {
+          violation="[Peer] appears before [Interface]"; violation_line="$n"; return; }
+        if [ "$seen_peer" = true ] && [ "$peer_public" = false ]; then
+          violation="Peer section has no PublicKey"; violation_line="$n"; return
+        fi
+        section=peer; seen_peer=true; peer_public=false; continue ;;
+      "["*"]")
+        violation="Unknown WireGuard section: $(trunc "$line")"
+        violation_line="$n"; return ;;
     esac
+    [ -n "$section" ] || {
+      violation="WireGuard setting appears before [Interface]"; violation_line="$n"; return; }
+    case "$line" in
+      *=*) key="${line%%=*}"; key="${key%"${key##*[![:space:]]}"}" ;;
+      *) violation="Expected WireGuard key = value"; violation_line="$n"; return ;;
+    esac
+    value="${line#*=}"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    [ -n "$value" ] || {
+      violation="WireGuard setting has an empty value: $(trunc "$key")"
+      violation_line="$n"; return; }
+    lower="$(printf '%s' "$key" | tr 'A-Z' 'a-z')"
+    case "$lower" in
+      postup|preup|postdown|predown)
+        violation="Directive executes code as root: $(trunc "$key")"; violation_line="$n"; return ;;
+    esac
+    if [ "$section" = interface ]; then
+      case "$key" in
+        PrivateKey) seen_private=true ;;
+        Address|DNS|MTU|Table|SaveConfig|ListenPort|FwMark) ;;
+        *) violation="Unsupported WireGuard interface setting: $(trunc "$key")"
+           violation_line="$n"; return ;;
+      esac
+    else
+      case "$key" in
+        PublicKey) peer_public=true ;;
+        PresharedKey|AllowedIPs|Endpoint|PersistentKeepalive) ;;
+        *) violation="Unsupported WireGuard peer setting: $(trunc "$key")"
+           violation_line="$n"; return ;;
+      esac
+    fi
   done <<<"$1"
+  [ "$seen_interface" = true ] || {
+    violation="No [Interface] section"; violation_line="$n"; return; }
+  [ "$seen_private" = true ] || {
+    violation="Interface section has no PrivateKey"; violation_line="$n"; return; }
+  [ "$seen_peer" = true ] || {
+    violation="Configuration has no [Peer] section"; violation_line="$n"; return; }
+  [ "$peer_public" = true ] || {
+    violation="Peer section has no PublicKey"; violation_line="$n"; return; }
 }
 
 # Determines the kind -- and does so BLOCK-AWARE, exactly like check_openvpn.
@@ -512,8 +566,8 @@ detect_kind() {
       case "${BASH_REMATCH[1]}" in connection) ;; *) inblock="${BASH_REMATCH[1]}" ;; esac
       continue
     fi
-    case "$line" in
-      *"[Interface]"*) printf 'wireguard'; return 0 ;;
+    case "$trimmed" in
+      "[Interface]") printf 'wireguard'; return 0 ;;
     esac
     if [ -z "$ovpn" ]; then
       case "$line" in
@@ -589,17 +643,15 @@ fi
 #
 # A symlink to a regular file passes [ -f ] AS WELL -- the test follows the
 # link. That is why the symlink test comes first and stands on its own: every
-# symlink pointing at something that exists is rejected, EVEN when the file
-# behind it happens to be byte-identical right now. A comparison would only
+# symlink is rejected, EVEN when the file behind it happens to be
+# byte-identical right now. A comparison would only
 # check this instant -- the symlink itself would remain, the list entry would
 # come into being, and it points at a file outside this program whose content
 # could be changed at any time without re-authenticating (it typically lives
-# in the user's HOME, which they can write themselves). A DEAD symlink is
-# explicitly exempt: [ -e ] is false for it, it falls through both tests and
-# is replaced below by 'mv -f' with a real 0600 file in the perfectly regular
-# way (mv replaces the link instead of following it) -- that is the existing
-# and still desired resolution for an orphaned file, not a regression.
-if [ -L "$target" ] && [ -e "$target" ]; then
+# in the user's HOME, which they can write themselves). Dead symlinks are
+# rejected as well: publication uses atomic no-replace semantics and never
+# removes an existing directory entry implicitly.
+if [ -L "$target" ]; then
   die 72 "target is a symlink: $target -- it could point at a file outside /etc whose content could be changed unnoticed and without re-authenticating. Remove it and pick the configuration again: sudo rm $target"
 fi
 
@@ -618,14 +670,16 @@ if [ -e "$target" ]; then
   die 72 "file already exists with different content: $target -- a connection removed earlier via the cross leaves its file behind if 'also delete the file' was not ticked. Either pick a different label or remove the file: sudo rm $target"
 fi
 
-# Write atomically: first beside it, then rename. An aborted import must not
-# leave half a configuration behind that 'systemctl start' could pick up. No
+# Write atomically: first beside it, then create the final name with a hard
+# link. link(2) fails atomically when the target name exists, unlike a
+# check followed by `mv -f`, which could overwrite a file created in between.
+# An aborted import must not leave half a configuration behind. No
 # separate chmod: thanks to 'umask 077' above, mktemp already creates the
 # file with 0600 -- an additional chmod call would only be one more external
 # command this root program depends on (and chmod is out of reach in the test
 # sandbox for good reason, see test/run-tests.sh).
 tmp="$(mktemp "$dir/.$name.XXXXXX")" || die 74 "could not create a temporary file in $dir"
-# On a signal in exactly this window (after mktemp, before mv), a temporary
+# On a signal in exactly this window (after mktemp, before publication), a temporary
 # file with key material would otherwise be left lying in /etc.
 trap 'rm -f "$tmp"' EXIT
 # The EXIT trap only cleans up. On a signal the script must also END: without
@@ -633,5 +687,9 @@ trap 'rm -f "$tmp"' EXIT
 # and write the target after all (Review I8).
 trap 'rm -f "$tmp"; exit 74' INT TERM
 printf '%s\n' "$content" >"$tmp" || { rm -f "$tmp"; die 74 "could not write"; }
-mv -f "$tmp" "$target" || { rm -f "$tmp"; die 74 "could not create $target"; }
+if ! "$LINK" "$tmp" "$target"; then
+  rm -f "$tmp"
+  die 72 "target appeared during import and was not overwritten: $target"
+fi
+rm -f "$tmp" || die 74 "could not remove temporary file"
 exit 0

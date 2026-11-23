@@ -70,6 +70,12 @@ fi
 # timeout exit code (6) was introduced -- by now a hard dependency, not
 # merely a convenience (review M10).
 command -v timeout >/dev/null 2>&1 || say "WARNING: timeout missing -- omarchy-vpn-list and omarchy-vpn-toggle need it."
+command -v flock >/dev/null 2>&1 || say "WARNING: flock missing -- VPN switching and connection-list updates need util-linux."
+command -v systemctl >/dev/null 2>&1 || say "WARNING: systemctl missing -- VPN unit status and switching cannot work."
+command -v tar >/dev/null 2>&1 || say "WARNING: tar missing -- ./install --system cannot transfer the reviewed payload."
+command -v sha256sum >/dev/null 2>&1 || say "WARNING: sha256sum missing -- inspection and system installation cannot verify payloads."
+command -v openvpn >/dev/null 2>&1 || say "NOTE: openvpn missing -- OpenVPN connections cannot start."
+command -v wg-quick >/dev/null 2>&1 || say "NOTE: wg-quick missing -- WireGuard connections cannot start."
 
 # Inspect only: never start a VPN as an installation check.
 if [ -x "$PRIV" ]; then
@@ -170,7 +176,8 @@ case "${uid:-}" in
 esac
 
 for f in omarchy-vpn-privileged omarchy-vpn-import omarchy-vpn-import.policy omarchy-vpn-switch.policy; do
-  [ -r "$DIR/share/$f" ] || { say "FAILED: missing: share/$f"; exit 1; }
+  [ -f "$DIR/share/$f" ] && [ ! -L "$DIR/share/$f" ] && [ -r "$DIR/share/$f" ] || {
+    say "FAILED: required payload is not a readable plain file: share/$f"; exit 1; }
 done
 
 # The payload is read ONCE, into a copy, and bound to a digest taken from

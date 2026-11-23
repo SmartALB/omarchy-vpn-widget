@@ -53,7 +53,7 @@ setup_sandbox() {
   mkdir -p "$SANDBOX/sysbin"
   local tool
   local toolpath
-  for tool in bash jq sed grep tail head cut cat mktemp mv rm mkdir basename dirname readlink env printf sort ln timeout sleep cmp stat sha256sum wc tr find mkfifo install id tar; do
+  for tool in bash jq sed grep tail head cut cat mktemp mv rm mkdir basename dirname readlink env printf sort ln timeout sleep cmp stat sha256sum wc tr find mkfifo install id tar flock; do
     toolpath="$(command -v "$tool" 2>/dev/null)"
     if [ -n "$toolpath" ]; then
       ln -sf "$toolpath" "$SANDBOX/sysbin/$tool"
@@ -205,6 +205,7 @@ STUB
   fi
   sed -e "s#^OPENVPN_DIR=/etc/openvpn/client\$#OPENVPN_DIR=$SANDBOX/etc/openvpn/client#" \
       -e "s#^WIREGUARD_DIR=/etc/wireguard\$#WIREGUARD_DIR=$SANDBOX/etc/wireguard#" \
+      -e "s#^LINK=/usr/bin/ln\$#LINK=$SANDBOX/stub/ln#" \
       "$PLUGIN_DIR/share/omarchy-vpn-import" >"$SANDBOX/priv/omarchy-vpn-import"
   # A positive test instead of a negative pattern (Review Important 1): a
   # negative pattern is only ever as good as the list of reformattings one
@@ -216,10 +217,15 @@ STUB
   # literally (`-F`) into the sandbox -- anything else is a failure, no
   # matter what it looks like.
   if ! grep -Fxq "OPENVPN_DIR=$SANDBOX/etc/openvpn/client" "$SANDBOX/priv/omarchy-vpn-import" ||
-     ! grep -Fxq "WIREGUARD_DIR=$SANDBOX/etc/wireguard" "$SANDBOX/priv/omarchy-vpn-import"; then
+     ! grep -Fxq "WIREGUARD_DIR=$SANDBOX/etc/wireguard" "$SANDBOX/priv/omarchy-vpn-import" ||
+     ! grep -Fxq "LINK=$SANDBOX/stub/ln" "$SANDBOX/priv/omarchy-vpn-import"; then
     echo "setup_sandbox: substitution failed, the copy does not point into the sandbox" >&2
     exit 1
   fi
+  cat >"$SANDBOX/stub/ln" <<STUB
+#!/usr/bin/env bash
+exec "$SANDBOX/sysbin/ln" "\$@"
+STUB
   # Review I7: the check above proves "a RIGHT line is there", not "no
   # WRONG one". A second assignment not hit by the sed pattern (say
   # "OPENVPN_DIR=/etc/openvpn/client  # comment" further down) would
@@ -2101,6 +2107,30 @@ test_import_writes_wireguard_config() {
   assert_eq "$(stat -c '%a' "$SANDBOX/etc/wireguard/homenet.conf")" "600"
 }
 
+test_import_never_overwrites_parallel_target() {
+  local p1 p2 r1=0 r2=0 successes
+  cat >"$SANDBOX/stub/ln" <<STUB
+#!/usr/bin/env bash
+printf 'ready\n' >>"$SANDBOX/link-barrier"
+deadline=\$((SECONDS + 3))
+while [ "\$(wc -l <"$SANDBOX/link-barrier")" -lt 2 ]; do
+  [ "\$SECONDS" -lt "\$deadline" ] || { echo "publication barrier timed out" >&2; exit 99; }
+  sleep 0.01
+done
+exec "$SANDBOX/sysbin/ln" "\$@"
+STUB
+  "$TEST_CHMOD" +x "$SANDBOX/stub/ln"
+  ovpn_ok | imp add openvpn ParallelRace >/dev/null 2>&1 & p1=$!
+  { ovpn_ok; printf 'verb 4\n'; } | imp add openvpn ParallelRace >/dev/null 2>&1 & p2=$!
+  wait "$p1" || r1=$?
+  wait "$p2" || r2=$?
+  successes=0
+  [ "$r1" -eq 0 ] && successes=$((successes + 1))
+  [ "$r2" -eq 0 ] && successes=$((successes + 1))
+  assert_eq "$successes" "1"
+  [ -f "$SANDBOX/etc/openvpn/client/ParallelRace.conf" ] || fail "winner did not publish a file"
+}
+
 # A configuration that differs from ovpn_ok by EXACTLY one harmless,
 # allowed line. 'verb' is on the allowlist -- so the difference lies purely
 # in the CONTENT, not in the question of whether the file passes the check.
@@ -2108,9 +2138,9 @@ test_import_writes_wireguard_config() {
 # happened.
 ovpn_ok_variant() { ovpn_ok; printf 'verb 4\n'; }
 
-# A property of the target file from which EVERY write can be read off: the
-# import writes via mktemp + mv, so a write inevitably changes the inode
-# number -- and the modification time with it.
+# A property of the target file from which EVERY write can be read off. A
+# successful publication links a newly created temporary inode into place;
+# rewriting would therefore change the inode number and modification time.
 file_fingerprint() { stat -c '%i %y %s' "$1"; }
 
 # A byte-identical existing file: nothing to do, success, NOTHING written.
@@ -2125,7 +2155,7 @@ test_import_accepts_identical_existing_file() {
   assert_eq "$rc" "0"
   after="$(file_fingerprint "$target")"
   # Inode AND modification time: had the import written, the inode alone
-  # would already be a different one (mktemp creates anew, mv renames).
+  # would already differ because publication starts from a new mktemp inode.
   assert_eq "$after" "$before"
   assert_eq "$(cat "$target")" "$(ovpn_ok)"
 }
@@ -2694,6 +2724,16 @@ test_config_adds_entry() {
   assert_eq "$(jq -r '.[0].group' "$OMARCHY_VPN_CONNECTIONS")" "work"
 }
 
+test_config_serializes_parallel_adds() {
+  local i
+  write_connections <<<'[]'
+  for i in {1..20}; do
+    cfg add "c$i" "Connection $i" "wg-quick@c$i" &
+  done
+  wait
+  assert_eq "$(jq -r 'length' "$OMARCHY_VPN_CONNECTIONS")" "20"
+}
+
 test_config_adds_without_group() {
   write_connections <<<'[]'
   cfg add home "Home" "wg-quick@home" || fail "add failed"
@@ -2800,45 +2840,32 @@ test_add_derives_wireguard_unit() {
   [ -f "$SANDBOX/etc/wireguard/Home_Net.conf" ] || fail "file is missing"
 }
 
-# THE REASON THE FINGERPRINT COULD GO -- and therefore the test without
-# which that reason rests on nothing: omarchy-vpn-add reads the file EXACTLY
-# ONCE and hands the same content to both the check and the import. A second
-# read would open the time window again that the fingerprint used to have to
-# close (TOCTOU): between "inspect agreed" and "import writes" the file
-# could be swapped.
+# omarchy-vpn-add reads the selected file EXACTLY ONCE and hands the same
+# content to both its check and the import. The panel fingerprint protects
+# the earlier preview-to-add boundary; this test protects add's own
+# inspect-to-import boundary.
 #
-# Shown with a 'cat' shim in $SANDBOX/stub. The sandbox PATH is exclusive
+# Shown with a 'head' shim in $SANDBOX/stub. The sandbox PATH is exclusive
 # and stub comes BEFORE sysbin, so the shim reliably takes effect. It counts
-# only calls WITH arguments -- an argument-less 'cat' reads stdin, which is
-# what omarchy-vpn-inspect and share/omarchy-vpn-import do, and that is not
-# what is meant here. From the SECOND read on it serves a poisoned version
-# containing 'up /tmp/evil.sh'.
-#
-# Two statements, deliberately both:
-#  * the counter ends at 1 -- the property itself;
-#  * the operation succeeds and the file written is the CLEAN one -- that is
-#    what turns the poisoning into a real trap instead of a claim. With two
-#    reads, share/omarchy-vpn-import would reject the poisoned second
-#    version with 71 and add would end on 14.
+# only the call that names the selected path; inspect and import read stdin.
+# The counter must end at one, and the operation must write those same bytes.
 test_add_reads_the_file_only_once() {
   local src reads
   write_connections <<<'[]'
   src="$(ovpn_file "once.ovpn")"
-  { ovpn_ok; printf 'up /tmp/evil.sh\n'; } >"$SANDBOX/cat-poison"
-  cat >"$SANDBOX/stub/cat" <<STUB
+  cat >"$SANDBOX/stub/head" <<STUB
 #!/usr/bin/env bash
-REAL="$SANDBOX/sysbin/cat"
-# Without arguments: stdin. Do not count it, pass it through unchanged.
-[ \$# -eq 0 ] && exec "\$REAL"
+REAL="$SANDBOX/sysbin/head"
+count=false
+for arg in "\$@"; do [ "\$arg" = "$src" ] && count=true; done
+[ "\$count" = true ] || exec "\$REAL" "\$@"
 n=0
-[ -r "$SANDBOX/cat-reads" ] && read -r n <"$SANDBOX/cat-reads"
+[ -r "$SANDBOX/head-reads" ] && read -r n <"$SANDBOX/head-reads"
 n=\$((n + 1))
-printf '%s\n' "\$n" >"$SANDBOX/cat-reads"
-# From the second read on: the poisoned version.
-[ "\$n" -ge 2 ] && exec "\$REAL" -- "$SANDBOX/cat-poison"
+printf '%s\n' "\$n" >"$SANDBOX/head-reads"
 exec "\$REAL" "\$@"
 STUB
-  "$TEST_CHMOD" +x "$SANDBOX/stub/cat"
+  "$TEST_CHMOD" +x "$SANDBOX/stub/head"
   # The test shell has already resolved 'cat' from $SANDBOX/sysbin and holds
   # it in its hash table (write_connections and config_file above use it).
   # Without 'hash -r' the counter-check below therefore pointed at sysbin
@@ -2850,16 +2877,36 @@ STUB
   # Counter-check on the shim itself: does it take effect at all? Without
   # this line the test would be green as soon as the shim failed to land in
   # PATH for whatever reason -- and would then check nothing.
-  assert_eq "$(command -v cat)" "$SANDBOX/stub/cat"
+  assert_eq "$(command -v head)" "$SANDBOX/stub/head"
 
   "$BIN/omarchy-vpn-add" "$src" "Office" || fail "add failed"
 
   reads=0
-  [ -r "$SANDBOX/cat-reads" ] && read -r reads <"$SANDBOX/cat-reads"
+  [ -r "$SANDBOX/head-reads" ] && read -r reads <"$SANDBOX/head-reads"
   assert_eq "$reads" "1"
   # And the clean version is what arrived, not the poisoned one.
   assert_eq "$(sha256sum <"$SANDBOX/etc/openvpn/client/Office.conf" | cut -d' ' -f1)" \
             "$("$SANDBOX/sysbin/cat" -- "$src" | "$BIN/omarchy-vpn-inspect" | jq -r '.sha256')"
+}
+
+test_add_rejects_file_changed_after_preview() {
+  local src sha rc=0 err
+  write_connections <<<'[]'
+  src="$(ovpn_file "preview.ovpn")"
+  sha="$("$BIN/omarchy-vpn-inspect" <"$src" | jq -r .sha256)"
+  printf '\nverb 4\n' >>"$src"
+  err="$("$BIN/omarchy-vpn-add" "$src" "Changed" "" "$sha" 2>&1)" || rc=$?
+  assert_eq "$rc" "16"
+  assert_contains "$err" "changed after preview"
+  [ ! -e "$SANDBOX/pkexec.log" ] || fail "authentication was requested after a fingerprint mismatch"
+}
+
+test_add_rejects_fifo_without_blocking() {
+  local fifo rc=0
+  fifo="$SANDBOX/source.fifo"
+  mkfifo "$fifo"
+  "$BIN/omarchy-vpn-add" "$fifo" "FIFO" >/dev/null 2>&1 || rc=$?
+  assert_eq "$rc" "10"
 }
 
 # The four error cases of the input file all end on exit 10; the four tests
@@ -3540,8 +3587,39 @@ test_add_rejects_oversized_file() {
   # pulls the whole file into the variable and the length check then reports
   # it just the same. A mutation probe showed exactly that. What the review
   # asked for is a bound on the read itself, so the bytes are never held.
-  grep -q 'cat -- "$path" 2>/dev/null | head -c' "$BIN/omarchy-vpn-add" || \
+  grep -q 'head -c \$((MAX_BYTES + 1)) -- "$path"' "$BIN/omarchy-vpn-add" || \
     fail "the read in omarchy-vpn-add is not bounded -- only its result is checked"
+}
+
+test_wireguard_requires_real_structure() {
+  local out
+  out="$(printf '# fake [Interface]\nPrivateKey = x\n' | inspect)"
+  assert_eq "$(printf '%s' "$out" | jq -r .ok)" "false"
+  out="$(printf '[Interface]\nAddress = 10.0.0.2/32\n[Peer]\nPublicKey = x\n' | inspect)"
+  assert_eq "$(printf '%s' "$out" | jq -r .ok)" "false"
+  assert_contains "$(printf '%s' "$out" | jq -r .error)" "PrivateKey"
+  out="$(printf '[Interface]\nPrivateKey = x\nUnknown = value\n[Peer]\nPublicKey = y\n' | inspect)"
+  assert_eq "$(printf '%s' "$out" | jq -r .ok)" "false"
+  assert_contains "$(printf '%s' "$out" | jq -r .error)" "Unsupported"
+  out="$(printf '[Interface]\nPrivateKey =   \n[Peer]\nPublicKey = y\n' | inspect)"
+  assert_eq "$(printf '%s' "$out" | jq -r .ok)" "false"
+  assert_contains "$(printf '%s' "$out" | jq -r .error)" "empty value"
+}
+
+test_panel_renders_dynamic_text_as_plain_text() {
+  local texts plain
+  texts="$(grep -cE '^[[:space:]]*Text[[:space:]]*\{' "$PLUGIN_DIR/Panel.qml")"
+  plain="$(grep -c 'textFormat: Text.PlainText' "$PLUGIN_DIR/Panel.qml")"
+  assert_eq "$plain" "$texts"
+}
+
+test_panel_exposes_keyboard_actions() {
+  local body
+  body="$(cat "$PLUGIN_DIR/Panel.qml")"
+  assert_contains "$body" "Keys.onReturnPressed"
+  assert_contains "$body" "Keys.onSpacePressed"
+  assert_contains "$body" "activeFocusOnTab"
+  assert_contains "$body" "Accessible.role"
 }
 
 # The connection list was read and parsed in full -- twice -- before the

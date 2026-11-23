@@ -1,7 +1,9 @@
 # VPN Units
 
-Version 2.0.0 changes the authorization model; existing installations require
-the explicit system migration below before switching connections again.
+Version 2.1.0 binds the preview to the imported bytes, serializes connection
+list updates, strengthens WireGuard validation and adds keyboard navigation.
+Installations upgrading from a version before 2.0.0 still require the explicit
+system migration below before switching connections again.
 
 An Omarchy Quickshell bar plugin for OpenVPN and WireGuard systemd units.
 Click a connection to start or stop it. Connections sharing a nonempty group
@@ -116,11 +118,15 @@ matching VPN units, not only those in the displayed list. Group membership
 comes from the user's list and is not a system-wide security policy.
 
 Click **Add connection**, select a local `.ovpn`/`.conf` file, inspect the
-preview and confirm. The import helper independently validates bounded input,
+preview and confirm. A SHA-256 fingerprint binds that preview to the bytes
+subsequently imported; a changed file is rejected and must be inspected again.
+The import helper independently validates bounded input,
 rejects unsupported/executable directives and publishes root-owned mode 0600
 files under `/etc/openvpn/client/` or `/etc/wireguard/`. Private file contents
 are piped to the importer, not placed in process arguments. Unrestricted
 OpenVPN `setenv` and executable hooks are rejected; `setenv-safe` is allowed.
+WireGuard imports require a real `[Interface]` with `PrivateKey` and at least
+one `[Peer]` with `PublicKey`; unknown settings and executable hooks are rejected.
 
 Names/labels/groups are user metadata, not credentials. Removing a list entry
 does not delete the VPN configuration unless file deletion is explicitly
@@ -133,6 +139,10 @@ referenced keys/files and unit overrides, remain the administrator's responsibil
   authorization. The panel additionally has a 120-second overall request limit,
   including the authentication dialog, and caps collected output.
 - Concurrent switch operations are refused using a root-side lock.
+- Connection-list updates are serialized, so concurrent CLI and panel changes
+  cannot silently replace each other.
+- Import publication uses atomic no-replace semantics. A configuration that
+  appears under the selected name during import is never overwritten.
 - A timeout does not cancel a systemd job already submitted; check unit state.
 - Unknown/unreadable service status prevents group switching rather than being
   treated as disconnected. The regular status display retains its simple
@@ -167,6 +177,9 @@ bash test/run-tests.sh
 ```
 
 `test/run-tests.sh` additionally covers import validation, bounded input,
-group handling, configuration operations and legacy-grant migration.
+group handling, concurrent configuration operations, preview fingerprints,
+keyboard/plain-text QML contracts and legacy-grant migration. CI also runs
+the helper suites, shell syntax checks, XML validation and repository-shape
+checks. Run `qmllint -I "$OMARCHY_PATH/shell" Panel.qml` on Omarchy itself.
 
 No real VPN credentials are needed for tests. License: MIT (see `LICENSE`).
