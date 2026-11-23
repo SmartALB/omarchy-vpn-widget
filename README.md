@@ -178,8 +178,8 @@ bash test/run-tests.sh
 
 `test/run-tests.sh` additionally covers import validation, bounded input,
 group handling, concurrent configuration operations, preview fingerprints,
-keyboard/plain-text QML contracts and legacy-grant migration. CI also runs
-the helper suites, shell syntax checks, XML validation and repository-shape
-checks. Run `qmllint -I "$OMARCHY_PATH/shell" Panel.qml` on Omarchy itself.
+keyboard/plain-text QML contracts and legacy-grant migration. Before release,
+also run shell syntax checks, XML validation, `omarchy plugin validate .` and
+`qmllint -I "$OMARCHY_PATH/shell" Panel.qml` on Omarchy itself.
 
 No real VPN credentials are needed for tests. License: MIT (see `LICENSE`).
